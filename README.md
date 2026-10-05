@@ -75,20 +75,20 @@ sologsb101-1002/
         ├── main.tsx             # 入口：ConfigProvider + RouterProvider
         ├── App.tsx              # 应用外壳（侧边导航 + 当前电站上下文）
         ├── styles/main.css
-        ├── types/               # plant.ts array.ts inverter.ts string.ts sample.ts disposal.ts settings.ts persistence.ts
-        ├── stores/              # plantStore.ts deviceStore.ts sampleStore.ts disposalStore.ts
+        ├── types/               # plant.ts array.ts inverter.ts string.ts sample.ts disposal.ts settings.ts relocation.ts persistence.ts
+        ├── stores/              # plantStore.ts deviceStore.ts sampleStore.ts disposalStore.ts relocationStore.ts
         ├── components/common/   # DiscreteBadge.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
         ├── hooks/               # useStringRank.ts useIdbTable.ts
         ├── pages/               # PlantList.tsx DeviceLedger.tsx SampleEntry.tsx DiagnoseBoard.tsx DisposalList.tsx SettingsView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
-        └── utils/               # discrete.ts unit.ts db.ts export.ts events.ts format.ts
+        └── utils/               # discrete.ts unit.ts db.ts export.ts events.ts format.ts relocation.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbpvstring`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，登记了 v1 → v2、v2 → v3 的 `upgrade` 迁移。v2 补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值；v3 增加整箱改挂冻结/对账锁、采集与处置独立归属，并为旧数据回填原归属和复测基准。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -98,7 +98,8 @@ sologsb101-1002/
   | `inverters` | 逆变器 | id / arrayId / model / ratedKw |
   | `strings` | 组串 | id / inverterId / combinerBox / code / moduleModel |
   | `samples` | 采集读数 | id / stringId / sampledAt / [stringId+sampledAt] |
-  | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate |
+  | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate / ownerInverterId / ownerCombinerBox |
+  | `relocations` | 整箱改挂冻结与对账计划 | id / status / sourceInverterId / targetInverterId / updatedAt |
   | `settings` | 阈值配置 | id（固定 `threshold`） |
 
 - **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 4 个采集点 + 5 张处置单，父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。

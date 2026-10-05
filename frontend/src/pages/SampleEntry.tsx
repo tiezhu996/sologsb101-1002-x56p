@@ -4,6 +4,7 @@
  */
 import { useMemo, useState } from 'react';
 import {
+  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -25,6 +26,7 @@ import { DeleteOutlined, EditOutlined, PlusOutlined, ThunderboltOutlined } from 
 import dayjs from 'dayjs';
 import { useSampleStore } from '../stores/sampleStore';
 import { useDeviceStore } from '../stores/deviceStore';
+import { useRelocationStore } from '../stores/relocationStore';
 import type { SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
 import { normalizeCurrent } from '../utils/discrete';
 import { formatCurrent, formatIrradiance, formatPercent, formatVoltage, share } from '../utils/unit';
@@ -61,6 +63,7 @@ export default function SampleEntry() {
   const deleteSample = useSampleStore((state) => state.deleteSample);
   const toggleMark = useSampleStore((state) => state.toggleMark);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
+  const activeRelocation = useRelocationStore((state) => state.activePlan);
 
   const strings = useDeviceStore((state) => state.strings);
   const inverters = useDeviceStore((state) => state.inverters);
@@ -244,14 +247,24 @@ export default function SampleEntry() {
             <Typography.Text type="secondary">只看可疑</Typography.Text>
             <Switch checked={onlySuspicious} onChange={setOnlySuspicious} size="small" />
           </Space>
-          <Button icon={<ThunderboltOutlined />} onClick={() => setBatchOpen(true)}>
+          <Button icon={<ThunderboltOutlined />} disabled={Boolean(activeRelocation)} onClick={() => setBatchOpen(true)}>
             按汇流箱批量录入
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => openModal(null)}>
+          <Button type="primary" icon={<PlusOutlined />} disabled={Boolean(activeRelocation)} onClick={() => openModal(null)}>
             单点录入
           </Button>
         </Space>
       </div>
+
+      {activeRelocation ? (
+        <Alert
+          showIcon
+          style={{ marginBottom: 12 }}
+          type={activeRelocation.status === 'failed' ? 'error' : 'warning'}
+          message={activeRelocation.status === 'failed' ? '改挂待恢复，采集录入已冻结' : '整箱改挂冻结中，采集录入已暂停'}
+          description="完成后会按设备新归属重算两端离散率与可疑标记。"
+        />
+      ) : null}
 
       <div className="gb-stat-grid">
         <StatBadge title="采集记录" value={totals.samples} suffix="条" color="#1668dc" />
@@ -316,7 +329,7 @@ export default function SampleEntry() {
                 createLabel="单点录入"
                 onCreate={() => openModal(null)}
                 extra={
-                  <Button icon={<ThunderboltOutlined />} onClick={() => setBatchOpen(true)}>
+                  <Button icon={<ThunderboltOutlined />} disabled={Boolean(activeRelocation)} onClick={() => setBatchOpen(true)}>
                     批量录入
                   </Button>
                 }
@@ -400,6 +413,7 @@ export default function SampleEntry() {
                           size="small"
                           type="link"
                           icon={<EditOutlined />}
+                          disabled={Boolean(activeRelocation)}
                           onClick={() => openModal(row)}
                         />
                         <Popconfirm
@@ -411,7 +425,7 @@ export default function SampleEntry() {
                             message.success('采集记录已删除');
                           }}
                         >
-                          <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+                          <Button size="small" type="link" danger disabled={Boolean(activeRelocation)} icon={<DeleteOutlined />} />
                         </Popconfirm>
                       </Space>
                     ),

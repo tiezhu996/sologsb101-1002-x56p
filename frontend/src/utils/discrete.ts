@@ -66,6 +66,25 @@ export function groupKeyOf(row: { inverterId: string; combinerBox: string }): st
   return `${row.inverterId}::${row.combinerBox}`;
 }
 
+/** 每组串取最近窗口的归一化均值，再按汇流箱计算跨组串离散率 */
+export function ownerDiscreteRate(samples: Sample[], config: ThresholdConfig = DEFAULT_THRESHOLDS): number {
+  const byString = new Map<string, Sample[]>();
+  for (const sample of samples) {
+    const list = byString.get(sample.stringId);
+    if (list) list.push(sample);
+    else byString.set(sample.stringId, [sample]);
+  }
+  const values = [...byString.values()].map((rows) =>
+    mean(
+      [...rows]
+        .sort((a, b) => a.sampledAt.localeCompare(b.sampledAt))
+        .slice(-8)
+        .map((row) => normalizeCurrent(row.currentA, row.irradianceWm2, config)),
+    ),
+  );
+  return discreteRate(values);
+}
+
 /**
  * 由采集记录聚合出组串离散率榜。
  * 同一汇流箱内的组串电流互为基准，逐组串计算离散率与电流偏差。
@@ -83,6 +102,7 @@ export function buildStringStats(
 
   interface Draft {
     stringId: string;
+    rows: Sample[];
     values: number[];
     raws: number[];
     lastSampledAt: string;
@@ -95,6 +115,7 @@ export function buildStringStats(
     const window = sorted.slice(-8);
     drafts.push({
       stringId,
+      rows: window,
       values: window.map((item) => normalizeCurrent(item.currentA, item.irradianceWm2, config)),
       raws: window.map((item) => item.currentA),
       lastSampledAt: sorted[sorted.length - 1]?.sampledAt ?? '',
@@ -105,8 +126,8 @@ export function buildStringStats(
   const stats: StringDiscreteStat[] = drafts.map((draft) => ({
     stringId: draft.stringId,
     stringCode: '',
-    combinerBox: '',
-    inverterId: '',
+    combinerBox: draft.rows[draft.rows.length - 1]?.ownerCombinerBox ?? '',
+    inverterId: draft.rows[draft.rows.length - 1]?.ownerInverterId ?? '',
     arrayId: '',
     plantId: '',
     sampleCount: draft.count,
@@ -127,23 +148,29 @@ export function buildStringStats(
     else buckets.set(key, [stat]);
   }
 
-  const globalBaseline = mean(stats.map((item) => item.avgNormalizedCurrentA));
-  for (const stat of stats) {
-    const baseline = globalBaseline > 0 ? globalBaseline : stat.avgNormalizedCurrentA;
-    stat.currentBiasPercent = currentBiasPercent(stat.avgNormalizedCurrentA, baseline);
-    const tooFew = stat.sampleCount < config.minSampleCount;
-    const badByRate = levelOf(stat.discreteRate, config);
-    const badByBias =
-      Math.abs(stat.currentBiasPercent) >= config.currentBiasPercent ? 'mismatch' : 'normal';
-    const level: DiscreteLevel =
-      badByRate === 'mismatch' || badByBias === 'mismatch'
-        ? 'mismatch'
-        : badByRate === 'watch'
-          ? 'watch'
-          : tooFew
+  for (const list of buckets.values()) {
+    const ownerSamples = samples.filter(
+      (item) =>
+        item.ownerInverterId === list[0].inverterId && item.ownerCombinerBox === list[0].combinerBox,
+    );
+    const rate = ownerDiscreteRate(ownerSamples, config);
+    const baseline = mean(list.map((item) => item.avgNormalizedCurrentA));
+    for (const stat of list) {
+      stat.discreteRate = rate;
+      stat.currentBiasPercent = currentBiasPercent(stat.avgNormalizedCurrentA, baseline);
+      const tooFew = stat.sampleCount < config.minSampleCount;
+      const badByRate = levelOf(stat.discreteRate, config);
+      const badByBias =
+        Math.abs(stat.currentBiasPercent) >= config.currentBiasPercent ? 'mismatch' : 'normal';
+      stat.level =
+        badByRate === 'mismatch' || badByBias === 'mismatch'
+          ? 'mismatch'
+          : badByRate === 'watch'
             ? 'watch'
-            : 'normal';
-    stat.level = level;
+            : tooFew
+              ? 'watch'
+              : 'normal';
+    }
   }
 
   return stats;

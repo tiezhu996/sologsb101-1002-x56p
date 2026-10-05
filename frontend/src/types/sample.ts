@@ -1,10 +1,16 @@
 import type { Revisioned } from './persistence';
+import type { OwnershipSnapshot } from './relocation';
 
 /** 组串采集读数 */
 export interface Sample {
   id: string;
   /** 所属组串 */
   stringId: string;
+  /** 采集处置侧归属，改挂后随组串更新；与设备台账侧归属独立对账 */
+  ownerInverterId: string;
+  ownerCombinerBox: string;
+  /** 首次归属，旧数据升级时按原 inverterId/箱号回填 */
+  originalOwner?: OwnershipSnapshot;
   /** 采集时间 yyyy-MM-dd HH:mm */
   sampledAt: string;
   /** 电流（A） */

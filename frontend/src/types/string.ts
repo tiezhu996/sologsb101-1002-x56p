@@ -1,10 +1,14 @@
 /** 组串 */
+import type { OwnershipSnapshot } from './relocation';
+
 export interface PvString {
   id: string;
   /** 所属逆变器 */
   inverterId: string;
   /** 汇流箱编号，如 BX-01 */
   combinerBox: string;
+  /** 首次设备归属，旧数据升级时回填 */
+  originalOwner?: OwnershipSnapshot;
   /** 组串编号，如 01-03 */
   code: string;
   /** 组件型号 */

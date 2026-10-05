@@ -1,4 +1,5 @@
 import type { Revisioned } from './persistence';
+import type { OwnershipSnapshot } from './relocation';
 
 /** 处置类型：清洗 / 更换 / 复测 */
 export type DisposalType = 'clean' | 'replace' | 'retest';
@@ -30,6 +31,11 @@ export interface Disposal {
   id: string;
   /** 关联组串 */
   stringId: string;
+  /** 采集处置侧归属，未完成单改挂后按新归属重派 */
+  ownerInverterId: string;
+  ownerCombinerBox: string;
+  /** 首次归属，旧数据升级时回填 */
+  originalOwner?: OwnershipSnapshot;
   /** 处置类型 */
   type: DisposalType;
   /** 状态 */
@@ -40,6 +46,10 @@ export interface Disposal {
   dueDate: string;
   /** 复测电流（A），已复测时必填 */
   retestCurrentA: number | null;
+  /** 复测结论采用的基准归属；已复测单改挂时保留原基准 */
+  baselineOwner?: OwnershipSnapshot | null;
+  /** 复测基准电流（A），升级旧数据时按原归属回填 */
+  baselineCurrentA?: number | null;
   /** 派工时登记的初始离散率（%） */
   initialDiscreteRate: number;
   createdAt: string;

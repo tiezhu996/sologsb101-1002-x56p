@@ -12,16 +12,24 @@ import type { Inverter } from '../types/inverter';
 import type { PvString } from '../types/string';
 import type { Sample } from '../types/sample';
 import type { Disposal } from '../types/disposal';
+import type { RelocationPlan } from '../types/relocation';
 import { DEFAULT_THRESHOLDS, type ThresholdRow } from '../types/settings';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
-import { normalizeCurrent, discreteRate } from './discrete';
+import { normalizeCurrent, ownerDiscreteRate } from './discrete';
+import {
+  cancelRelocationPlan as cancelPureRelocationPlan,
+  executeRelocationPlan as executePureRelocationPlan,
+  freezeRelocationPlan as freezePureRelocationPlan,
+  restoreConfirmedOwnership,
+  type RelocationSnapshot,
+} from './relocation';
 import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 
 /** 数据库名（浏览器 IndexedDB 库名） */
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -32,6 +40,7 @@ export type InverterRow = Inverter & Revisioned;
 export type StringRow = PvString & Revisioned;
 export type SampleRow = Sample & Revisioned;
 export type DisposalRow = Disposal & Revisioned;
+export type RelocationPlanRow = RelocationPlan & Revisioned;
 
 class PvStringDatabase extends Dexie {
   plants!: Table<PlantRow, string>;
@@ -40,6 +49,7 @@ class PvStringDatabase extends Dexie {
   strings!: Table<StringRow, string>;
   samples!: Table<SampleRow, string>;
   disposals!: Table<DisposalRow, string>;
+  relocations!: Table<RelocationPlanRow, string>;
   settings!: Table<ThresholdRow, string>;
 
   constructor() {
@@ -95,6 +105,93 @@ class PvStringDatabase extends Dexie {
         if (!existing) {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
         }
+      });
+
+    // v3：整箱改挂冻结/对账锁；采集与处置表独立保存归属，升级时按原归属回填并固化复测基准
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plants: 'id, name, gridDate, latitude, capacityMWp',
+        arrays: 'id, plantId, code, capacityKw',
+        inverters: 'id, arrayId, model, ratedKw',
+        strings: 'id, inverterId, combinerBox, code, moduleModel',
+        samples:
+          'id, stringId, sampledAt, ownerInverterId, ownerCombinerBox, [stringId+sampledAt], [ownerInverterId+ownerCombinerBox]',
+        disposals:
+          'id, stringId, state, type, owner, dueDate, ownerInverterId, ownerCombinerBox',
+        relocations: 'id, status, sourceInverterId, targetInverterId, updatedAt',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        const stringRows = await tx.table<StringRow>('strings').toArray();
+        const sampleRows = await tx.table<SampleRow>('samples').toArray();
+        const threshold =
+          (await tx.table<ThresholdRow>('settings').get('threshold')) ?? DEFAULT_THRESHOLDS;
+        const stringOwner = new Map(
+          stringRows.map((row) => [row.id, { inverterId: row.inverterId, combinerBox: row.combinerBox }]),
+        );
+
+        await tx.table('strings').toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION;
+          if (!row.originalOwner) {
+            row.originalOwner = { inverterId: row.inverterId, combinerBox: row.combinerBox };
+          }
+        });
+
+        const ownerSamples = new Map<string, SampleRow[]>();
+        for (const row of sampleRows) {
+          const owner = stringOwner.get(row.stringId) ?? {
+            inverterId: String(row.ownerInverterId ?? ''),
+            combinerBox: String(row.ownerCombinerBox ?? ''),
+          };
+          row.ownerInverterId = owner.inverterId;
+          row.ownerCombinerBox = owner.combinerBox;
+          row.originalOwner = { ...owner };
+          row.revision = ROW_REVISION;
+          const list = ownerSamples.get(`${owner.inverterId}::${owner.combinerBox}`);
+          if (list) list.push(row);
+          else ownerSamples.set(`${owner.inverterId}::${owner.combinerBox}`, [row]);
+        }
+
+        const ownerBaseline = new Map<string, number>();
+        for (const [key, rows] of ownerSamples) {
+          const byString = new Map<string, number[]>();
+          for (const row of rows) {
+            const values = byString.get(row.stringId) ?? [];
+            values.push(normalizeCurrent(row.currentA, row.irradianceWm2, threshold));
+            byString.set(row.stringId, values);
+          }
+          const averages = [...byString.values()].map((values) =>
+            values.reduce((sum, value) => sum + value, 0) / values.length,
+          );
+          if (averages.length > 0) {
+            ownerBaseline.set(key, Number((averages.reduce((sum, value) => sum + value, 0) / averages.length).toFixed(3)));
+          }
+        }
+
+        await tx.table('samples').clear();
+        await tx.table<SampleRow>('samples').bulkPut(sampleRows);
+
+        const disposalRows = (await tx.table<DisposalRow>('disposals').toArray()).map((row) => {
+          const owner = stringOwner.get(row.stringId) ?? {
+            inverterId: row.ownerInverterId ?? '',
+            combinerBox: row.ownerCombinerBox ?? '',
+          };
+          const next: DisposalRow = {
+            ...row,
+            ownerInverterId: owner.inverterId,
+            ownerCombinerBox: owner.combinerBox,
+            originalOwner: { ...owner },
+            revision: ROW_REVISION,
+          };
+          if (next.state === 'retested' && !next.baselineOwner) {
+            const key = `${owner.inverterId}::${owner.combinerBox}`;
+            next.baselineOwner = { ...owner };
+            next.baselineCurrentA = ownerBaseline.get(key) ?? 9.4;
+          }
+          return next;
+        });
+        await tx.table('disposals').clear();
+        await tx.table<DisposalRow>('disposals').bulkPut(disposalRows);
       });
   }
 }
@@ -292,6 +389,7 @@ async function seedDatabase(): Promise<void> {
               id: stringId,
               inverterId,
               combinerBox: boxPlan.box,
+              originalOwner: { inverterId, combinerBox: boxPlan.box },
               code: `${boxPlan.box.replace('BX-', '')}-${String(offset + 1).padStart(2, '0')}`,
               moduleModel: boxPlan.moduleModel,
               seriesCount: boxPlan.seriesCount,
@@ -311,6 +409,9 @@ async function seedDatabase(): Promise<void> {
               samples.push({
                 id: `smp-${stringId}-${point + 1}`,
                 stringId,
+                ownerInverterId: inverterId,
+                ownerCombinerBox: boxPlan.box,
+                originalOwner: { inverterId, combinerBox: boxPlan.box },
                 sampledAt,
                 currentA,
                 voltageV: round(boxPlan.seriesCount * 41.6 + random() * 22, 1),
@@ -337,18 +438,23 @@ async function seedDatabase(): Promise<void> {
     else byBucket.set(key, [sample]);
   }
   for (const list of byBucket.values()) {
-    const byString = new Map<string, SampleRow[]>();
-    for (const sample of list) {
-      const rows = byString.get(sample.stringId);
-      if (rows) rows.push(sample);
-      else byString.set(sample.stringId, [sample]);
+    const rate = ownerDiscreteRate(list);
+    for (const row of list) row.discreteRate = rate;
+  }
+
+  const ownerBaselines = new Map<string, number>();
+  for (const [key, list] of byBucket) {
+    const byString = new Map<string, number[]>();
+    for (const row of list) {
+      const values = byString.get(row.stringId) ?? [];
+      values.push(normalizeCurrent(row.currentA, row.irradianceWm2));
+      byString.set(row.stringId, values);
     }
-    for (const rows of byString.values()) {
-      const rate = discreteRate(
-        rows.map((row) => normalizeCurrent(row.currentA, row.irradianceWm2)),
-      );
-      for (const row of rows) row.discreteRate = rate;
-    }
+    const averages = [...byString.values()].map((values) => values.reduce((sum, value) => sum + value, 0) / values.length);
+    ownerBaselines.set(
+      key,
+      Number((averages.reduce((sum, value) => sum + value, 0) / averages.length).toFixed(3)),
+    );
   }
 
   // 处置单：为离散率最高的前 5 个组串建单，状态各不相同
@@ -362,14 +468,25 @@ async function seedDatabase(): Promise<void> {
   const owners = ['李文波', '张启明', '王慧敏'];
   ranked.forEach(([stringId, rate], index) => {
     const state = states[index % states.length];
+    const owner = strings.find((item) => item.id === stringId);
     disposals.push({
       id: `disp-${index + 1}`,
       stringId,
+      ownerInverterId: owner?.inverterId ?? '',
+      ownerCombinerBox: owner?.combinerBox ?? '',
+      originalOwner: owner ? { inverterId: owner.inverterId, combinerBox: owner.combinerBox } : undefined,
       type: types[index % types.length],
       state,
       owner: owners[index % owners.length],
       dueDate: shiftDate(index % 2 === 0 ? 3 : -2),
       retestCurrentA: state === 'retested' ? round(9.1 + index * 0.18, 2) : null,
+      baselineOwner:
+        state === 'retested' && owner
+          ? { inverterId: owner.inverterId, combinerBox: owner.combinerBox }
+          : null,
+      baselineCurrentA: state === 'retested' && owner
+        ? ownerBaselines.get(`${owner.inverterId}::${owner.combinerBox}`) ?? 9.4
+        : null,
       initialDiscreteRate: rate,
       createdAt: stamp,
       updatedAt: stamp,
@@ -379,7 +496,7 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.relocations, db.settings],
     async () => {
       await db.plants.bulkPut(plants);
       await db.arrays.bulkPut(arrays);
@@ -419,11 +536,13 @@ export async function getPlant(id: string): Promise<PlantRow | undefined> {
 }
 
 export async function putPlant(row: PlantRow): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.plants.put(row);
 }
 
 /** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 */
 export async function removePlant(id: string): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.transaction(
     'rw',
     [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals],
@@ -463,10 +582,12 @@ export async function listArraysByPlant(plantId: string): Promise<ArrayRow[]> {
 }
 
 export async function putArray(row: ArrayRow): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.arrays.put(row);
 }
 
 export async function removeArray(id: string): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.transaction('rw', [db.arrays, db.inverters, db.strings, db.samples, db.disposals], async () => {
     const inverterRows = await db.inverters.where('arrayId').equals(id).toArray();
     const inverterIds = inverterRows.map((item) => item.id);
@@ -495,10 +616,12 @@ export async function listInvertersByArray(arrayId: string): Promise<InverterRow
 }
 
 export async function putInverter(row: InverterRow): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.inverters.put(row);
 }
 
 export async function removeInverter(id: string): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals], async () => {
     const stringRows = await db.strings.where('inverterId').equals(id).toArray();
     const stringIds = stringRows.map((item) => item.id);
@@ -522,15 +645,30 @@ export async function listStringsByInverter(inverterId: string): Promise<StringR
   return rows.sort((a, b) => a.code.localeCompare(b.code));
 }
 
+async function assertNoFrozenRelocation(): Promise<void> {
+  const active = await getActiveRelocationPlan();
+  if (active) {
+    throw new Error(
+      active.status === 'failed'
+        ? `改挂计划 ${active.id} 写入失败待恢复，请先重试或取消`
+        : `改挂计划 ${active.id} 已冻结，请先完成或取消后再录入/派工`,
+    );
+  }
+}
+
+/** 冻结期间禁止改台账；改挂事务本身不经过这些单表写入口 */
 export async function putString(row: StringRow): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.strings.put(row);
 }
 
 export async function putStrings(rows: StringRow[]): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.strings.bulkPut(rows);
 }
 
 export async function removeString(id: string): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.transaction('rw', [db.strings, db.samples, db.disposals], async () => {
     await db.samples.where('stringId').equals(id).delete();
     await db.disposals.where('stringId').equals(id).delete();
@@ -551,14 +689,17 @@ export async function listSamplesByString(stringId: string): Promise<SampleRow[]
 }
 
 export async function putSample(row: SampleRow): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.samples.put(row);
 }
 
 export async function putSamples(rows: SampleRow[]): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.samples.bulkPut(rows);
 }
 
 export async function removeSample(id: string): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.samples.delete(id);
 }
 
@@ -570,11 +711,135 @@ export async function listDisposals(): Promise<DisposalRow[]> {
 }
 
 export async function putDisposal(row: DisposalRow): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.disposals.put(row);
 }
 
 export async function removeDisposal(id: string): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.disposals.delete(id);
+}
+
+/* ============================= 整箱改挂 ============================= */
+
+export async function listRelocationPlans(): Promise<RelocationPlanRow[]> {
+  const rows = await db.relocations.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function getActiveRelocationPlan(): Promise<RelocationPlanRow | null> {
+  const rows = await db.relocations.where('status').anyOf(['frozen', 'failed']).toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0] ?? null;
+}
+
+async function relocationSnapshot(): Promise<RelocationSnapshot> {
+  const [inverters, strings, samples, disposals, activePlan] = await Promise.all([
+    listInverters(),
+    listStrings(),
+    listSamples(),
+    listDisposals(),
+    getActiveRelocationPlan(),
+  ]);
+  return { inverters, strings, samples, disposals, activePlan };
+}
+
+async function commitRelocationMutation(mutation: {
+  strings: StringRow[];
+  samples: SampleRow[];
+  disposals: DisposalRow[];
+  plan: RelocationPlanRow;
+}): Promise<void> {
+  await db.transaction(
+    'rw',
+    [db.strings, db.samples, db.disposals, db.relocations],
+    async () => {
+      await db.strings.bulkPut(mutation.strings);
+      await db.samples.bulkPut(mutation.samples);
+      await db.disposals.bulkPut(mutation.disposals);
+      await db.relocations.put(mutation.plan);
+    },
+  );
+}
+
+/** 冻结两端录入与派工，并返回已核对确认的计划；此时不改设备归属 */
+export async function freezeRelocationPlan(input: Parameters<typeof freezePureRelocationPlan>[0]): Promise<RelocationPlanRow> {
+  const snapshot = await relocationSnapshot();
+  const mutation = freezePureRelocationPlan(input, snapshot);
+  const row: RelocationPlanRow = { ...mutation.plan, revision: ROW_REVISION };
+  await db.relocations.put(row);
+  return row;
+}
+
+export interface AppliedRelocation {
+  plan: RelocationPlanRow;
+  result: Awaited<ReturnType<typeof executePureRelocationPlan>>['result'];
+}
+
+/** 执行冻结计划；任一步写入失败则恢复已确认范围中已经写入的归属，重试只处理仍在原归属的范围 */
+export async function executeRelocationPlan(planId: string): Promise<AppliedRelocation> {
+  const plan = await db.relocations.get(planId);
+  if (!plan) throw new Error('改挂计划不存在');
+  if (plan.status === 'completed') return { plan, result: await completedRelocationResult(plan) };
+
+  const snapshot = await relocationSnapshot();
+  const thresholds = await getThresholds();
+  let applied: ReturnType<typeof executePureRelocationPlan>;
+  try {
+    applied = executePureRelocationPlan(plan, snapshot, thresholds);
+  } catch (error) {
+    throw error instanceof Error ? error : new Error('整箱改挂校验失败');
+  }
+
+  try {
+    await commitRelocationMutation({
+      strings: applied.strings as StringRow[],
+      samples: applied.samples as SampleRow[],
+      disposals: applied.disposals as DisposalRow[],
+      plan: { ...applied.plan, revision: ROW_REVISION },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '整箱改挂写入失败';
+    const current = await relocationSnapshot();
+    const restored = restoreConfirmedOwnership(plan, current, message);
+    await commitRelocationMutation({
+      strings: restored.strings as StringRow[],
+      samples: restored.samples as SampleRow[],
+      disposals: restored.disposals as DisposalRow[],
+      plan: { ...restored.plan, revision: ROW_REVISION },
+    });
+    throw new Error(`${message}；已恢复设备归属，可按已确认范围重试`);
+  }
+
+  return { plan: { ...applied.plan, revision: ROW_REVISION }, result: applied.result };
+}
+
+async function completedRelocationResult(
+  plan: RelocationPlanRow,
+): Promise<AppliedRelocation['result']> {
+  const samples = await listSamples();
+  const targetRate = samples
+    .filter((item) => item.ownerInverterId === plan.targetInverterId && item.ownerCombinerBox === plan.targetCombinerBox)
+    .reduce((max, item) => Math.max(max, item.discreteRate), 0);
+  return {
+    planId: plan.id,
+    relocatedStringIds: plan.confirmedStringIds,
+    reassignedDisposalIds: [],
+    retestedDisposalIds: [],
+    rates: {
+      oldLedgerRate: 0,
+      oldCollectionRate: 0,
+      newLedgerRate: targetRate,
+      newCollectionRate: targetRate,
+    },
+    suspiciousStringIds: [],
+    reconciled: true,
+  };
+}
+
+export async function cancelRelocationPlan(planId: string): Promise<void> {
+  const plan = await db.relocations.get(planId);
+  if (!plan) return;
+  await db.relocations.put({ ...cancelPureRelocationPlan(plan), revision: ROW_REVISION });
 }
 
 /* ============================ 阈值配置 ============================ */
@@ -600,6 +865,7 @@ export interface DatabaseSnapshot {
   strings: PvString[];
   samples: Sample[];
   disposals: Disposal[];
+  relocations: RelocationPlan[];
   thresholds: ThresholdRow;
 }
 
@@ -608,14 +874,90 @@ function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
   return rest;
 }
 
+/** 导入旧版本备份时同样回填独立归属与原归属，避免老数据绕过 v3 升级 */
+function normalizeSnapshotRows(snapshot: DatabaseSnapshot): {
+  strings: StringRow[];
+  samples: SampleRow[];
+  disposals: DisposalRow[];
+  relocations: RelocationPlanRow[];
+} {
+  const ownerByString = new Map(
+    snapshot.strings.map((row) => [row.id, { inverterId: row.inverterId, combinerBox: row.combinerBox }]),
+  );
+  const strings = snapshot.strings.map((row) => ({
+    ...row,
+    originalOwner: row.originalOwner ?? { inverterId: row.inverterId, combinerBox: row.combinerBox },
+    revision: ROW_REVISION,
+  }));
+  const samples = (snapshot.samples ?? []).map((row) => {
+    const owner = ownerByString.get(row.stringId) ?? {
+      inverterId: row.ownerInverterId ?? '',
+      combinerBox: row.ownerCombinerBox ?? '',
+    };
+    return {
+      ...row,
+      ownerInverterId: owner.inverterId,
+      ownerCombinerBox: owner.combinerBox,
+      originalOwner: row.originalOwner ?? { ...owner },
+      revision: ROW_REVISION,
+    };
+  });
+  const ownerSamples = new Map<string, SampleRow[]>();
+  for (const row of samples) {
+    const list = ownerSamples.get(`${row.ownerInverterId}::${row.ownerCombinerBox}`);
+    if (list) list.push(row);
+    else ownerSamples.set(`${row.ownerInverterId}::${row.ownerCombinerBox}`, [row]);
+  }
+  const ownerBaseline = new Map<string, number>();
+  for (const [key, rows] of ownerSamples) {
+    const byString = new Map<string, number[]>();
+    for (const row of rows) {
+      const values = byString.get(row.stringId) ?? [];
+      values.push(normalizeCurrent(row.currentA, row.irradianceWm2, snapshot.thresholds ?? DEFAULT_THRESHOLDS));
+      byString.set(row.stringId, values);
+    }
+    const averages = [...byString.values()].map(
+      (values) => values.reduce((sum, value) => sum + value, 0) / values.length,
+    );
+    if (averages.length > 0) {
+      ownerBaseline.set(
+        key,
+        Number((averages.reduce((sum, value) => sum + value, 0) / averages.length).toFixed(3)),
+      );
+    }
+  }
+  const disposals = (snapshot.disposals ?? []).map((row) => {
+    const owner = ownerByString.get(row.stringId) ?? {
+      inverterId: row.ownerInverterId ?? '',
+      combinerBox: row.ownerCombinerBox ?? '',
+    };
+    const next: DisposalRow = {
+      ...row,
+      ownerInverterId: owner.inverterId,
+      ownerCombinerBox: owner.combinerBox,
+      originalOwner: row.originalOwner ?? { ...owner },
+      revision: ROW_REVISION,
+    };
+    if (next.state === 'retested' && !next.baselineOwner) {
+      const key = `${owner.inverterId}::${owner.combinerBox}`;
+      next.baselineOwner = { ...owner };
+      next.baselineCurrentA = ownerBaseline.get(key) ?? 9.4;
+    }
+    return next;
+  });
+  const relocations = (snapshot.relocations ?? []).map((row) => ({ ...row, revision: ROW_REVISION }));
+  return { strings, samples, disposals, relocations };
+}
+
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plants, arrays, inverters, strings, samples, disposals, thresholds] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, relocations, thresholds] = await Promise.all([
     listPlants(),
     listArrays(),
     listInverters(),
     listStrings(),
     listSamples(),
     listDisposals(),
+    listRelocationPlans(),
     getThresholds(),
   ]);
   return {
@@ -628,15 +970,17 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     strings: strings.map(stripRevision),
     samples: samples.map(stripRevision),
     disposals: disposals.map(stripRevision),
+    relocations: relocations.map(stripRevision),
     thresholds,
   };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
+  await assertNoFrozenRelocation();
+  const normalized = normalizeSnapshotRows(snapshot);
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.relocations, db.settings],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -645,13 +989,16 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.strings.clear(),
         db.samples.clear(),
         db.disposals.clear(),
+        db.relocations.clear(),
       ]);
+      const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
       await db.plants.bulkPut((snapshot.plants ?? []).map(rev));
       await db.arrays.bulkPut((snapshot.arrays ?? []).map(rev));
       await db.inverters.bulkPut((snapshot.inverters ?? []).map(rev));
-      await db.strings.bulkPut((snapshot.strings ?? []).map(rev));
-      await db.samples.bulkPut((snapshot.samples ?? []).map(rev));
-      await db.disposals.bulkPut((snapshot.disposals ?? []).map(rev));
+      await db.strings.bulkPut(normalized.strings);
+      await db.samples.bulkPut(normalized.samples);
+      await db.disposals.bulkPut(normalized.disposals);
+      await db.relocations.bulkPut(normalized.relocations);
       if (snapshot.thresholds) await db.settings.put(snapshot.thresholds);
     },
   );
@@ -659,9 +1006,10 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 
 /** 清空并重新播种（/settings 页的重置入口） */
 export async function resetDatabase(): Promise<void> {
+  await assertNoFrozenRelocation();
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.relocations, db.settings],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -670,6 +1018,7 @@ export async function resetDatabase(): Promise<void> {
         db.strings.clear(),
         db.samples.clear(),
         db.disposals.clear(),
+        db.relocations.clear(),
         db.settings.clear(),
       ]);
     },
@@ -719,6 +1068,7 @@ export function newStringRow(input: {
     id: uuid(),
     inverterId: input.inverterId,
     combinerBox: input.combinerBox,
+    originalOwner: { inverterId: input.inverterId, combinerBox: input.combinerBox },
     code: input.code,
     moduleModel: input.moduleModel,
     seriesCount: input.seriesCount,

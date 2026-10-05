@@ -23,7 +23,7 @@ import {
 import type { SampleDraft, SampleRow as SampleViewRow, StringDiscreteStat } from '../types/sample';
 import type { ThresholdConfig } from '../types/settings';
 import { DEFAULT_THRESHOLDS } from '../types/settings';
-import { buildStringStats, discreteRate, normalizeCurrent } from '../utils/discrete';
+import { buildStringStats, normalizeCurrent, ownerDiscreteRate } from '../utils/discrete';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
 
@@ -49,6 +49,7 @@ interface SampleStoreState {
   deleteSamplesOfString: (stringId: string) => Promise<void>;
   toggleMark: (stringId: string) => void;
   markMany: (stringIds: string[]) => void;
+  remarkAfterRelocation: (confirmedStringIds: string[], suspiciousStringIds: string[]) => void;
   clearMarks: () => void;
   sampleRows: () => SampleViewRow[];
   samplesOfString: (stringId: string) => SampleRow[];
@@ -56,6 +57,14 @@ interface SampleStoreState {
   suspiciousStats: () => StringDiscreteStat[];
   /** 重新计算并落库某组串的离散率（录入后调用） */
   recalcDiscreteRate: (stringId: string) => Promise<number>;
+}
+
+function ownershipOfString(
+  strings: StringRow[],
+  stringId: string,
+): { inverterId: string; combinerBox: string } {
+  const owner = strings.find((item) => item.id === stringId);
+  return { inverterId: owner?.inverterId ?? '', combinerBox: owner?.combinerBox ?? '' };
 }
 
 function hydrateStats(
@@ -69,14 +78,14 @@ function hydrateStats(
   const base = buildStringStats(samples, thresholds);
   return base.map((stat) => {
     const owner = strings.find((item) => item.id === stat.stringId);
-    const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
+    const inverter = inverters.find((item) => item.id === stat.inverterId);
     const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
     const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
     return {
       ...stat,
       stringCode: owner?.code ?? '已删除组串',
-      combinerBox: owner?.combinerBox ?? '-',
-      inverterId: inverter?.id ?? '',
+      combinerBox: stat.combinerBox || owner?.combinerBox || '-',
+      inverterId: stat.inverterId || inverter?.id || '',
       arrayId: array?.id ?? '',
       plantId: plant?.id ?? '',
     };
@@ -143,9 +152,13 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async addSample(draft) {
+    const owner = ownershipOfString(get().strings, draft.stringId);
     const row: SampleRow = {
       id: uuid(),
       stringId: draft.stringId,
+      ownerInverterId: owner.inverterId,
+      ownerCombinerBox: owner.combinerBox,
+      originalOwner: { ...owner },
       sampledAt: draft.sampledAt,
       currentA: draft.currentA,
       voltageV: draft.voltageV,
@@ -164,9 +177,13 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   async addBatchSamples(drafts) {
     const rows: SampleRow[] = [];
     for (const draft of drafts) {
+      const owner = ownershipOfString(get().strings, draft.stringId);
       rows.push({
         id: uuid(),
         stringId: draft.stringId,
+        ownerInverterId: owner.inverterId,
+        ownerCombinerBox: owner.combinerBox,
+        originalOwner: { ...owner },
         sampledAt: draft.sampledAt,
         currentA: draft.currentA,
         voltageV: draft.voltageV,
@@ -190,9 +207,13 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   async updateSample(sampleId, draft) {
     const existing = get().samples.find((item) => item.id === sampleId);
     if (!existing) return;
+    const owner = ownershipOfString(get().strings, draft.stringId);
     await putSample({
       ...existing,
       stringId: draft.stringId,
+      ownerInverterId: owner.inverterId,
+      ownerCombinerBox: owner.combinerBox,
+      originalOwner: existing.originalOwner ?? { ...owner },
       sampledAt: draft.sampledAt,
       currentA: draft.currentA,
       voltageV: draft.voltageV,
@@ -229,6 +250,16 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
     set((state) => ({ markedStringIds: [...new Set([...state.markedStringIds, ...stringIds])] }));
   },
 
+  remarkAfterRelocation(confirmedStringIds, suspiciousStringIds) {
+    const confirmed = new Set(confirmedStringIds);
+    set((state) => ({
+      markedStringIds: [
+        ...state.markedStringIds.filter((id) => !confirmed.has(id)),
+        ...suspiciousStringIds,
+      ],
+    }));
+  },
+
   clearMarks() {
     set({ markedStringIds: [] });
   },
@@ -236,15 +267,15 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   sampleRows() {
     const { samples, strings, inverters, arrays, plants, thresholds } = get();
     return samples.map((sample) => {
-      const owner = strings.find((item) => item.id === sample.stringId);
-      const inverter = owner ? inverters.find((item) => item.id === owner.inverterId) : undefined;
+      const ownerString = strings.find((item) => item.id === sample.stringId);
+      const inverter = inverters.find((item) => item.id === sample.ownerInverterId);
       const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
       const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
       return {
         ...sample,
-        stringCode: owner?.code ?? '已删除组串',
-        combinerBox: owner?.combinerBox ?? '-',
-        inverterId: inverter?.id ?? '',
+        stringCode: ownerString?.code ?? '已删除组串',
+        combinerBox: sample.ownerCombinerBox || '-',
+        inverterId: inverter?.id ?? sample.ownerInverterId,
         inverterModel: inverter?.model ?? '-',
         arrayId: array?.id ?? '',
         arrayCode: array?.code ?? '-',
@@ -270,17 +301,17 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async recalcDiscreteRate(stringId) {
-    const { strings, samples } = get();
-    const owner = strings.find((item) => item.id === stringId);
-    if (!owner) return 0;
-    const peers = strings.filter(
-      (item) => item.inverterId === owner.inverterId && item.combinerBox === owner.combinerBox,
+    const { strings, samples, thresholds } = get();
+    const ownerString = strings.find((item) => item.id === stringId);
+    if (!ownerString) return 0;
+    const latest = samples.find((item) => item.stringId === stringId);
+    const owner = latest
+      ? { inverterId: latest.ownerInverterId, combinerBox: latest.ownerCombinerBox }
+      : { inverterId: ownerString.inverterId, combinerBox: ownerString.combinerBox };
+    const targets = samples.filter(
+      (item) => item.ownerInverterId === owner.inverterId && item.ownerCombinerBox === owner.combinerBox,
     );
-    const peerIds = new Set(peers.map((item) => item.id));
-    const scope = samples.length > 0 ? samples : await listSamples();
-    const targets = scope.filter((item) => peerIds.has(item.stringId));
-    const values = targets.slice(-40).map((item) => normalizeCurrent(item.currentA, item.irradianceWm2));
-    const rate = discreteRate(values.length > 0 ? values : [0]);
+    const rate = ownerDiscreteRate(targets, thresholds);
     // 同一汇流箱内组串互为基准：把该汇流箱下全部采集记录的离散率一起回写，保证口径一致
     await Promise.all(targets.map((item) => putSample({ ...item, discreteRate: rate })));
     return rate;

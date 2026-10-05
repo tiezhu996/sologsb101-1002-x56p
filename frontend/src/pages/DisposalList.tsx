@@ -5,6 +5,7 @@
  */
 import { useMemo, useState } from 'react';
 import {
+  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -34,6 +35,7 @@ import dayjs from 'dayjs';
 import { useDisposalStore } from '../stores/disposalStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useSampleStore } from '../stores/sampleStore';
+import { useRelocationStore } from '../stores/relocationStore';
 import {
   DISPOSAL_STATE_LABEL,
   DISPOSAL_TYPE_LABEL,
@@ -73,21 +75,31 @@ export default function DisposalList() {
   const plants = useDeviceStore((state) => state.plants);
   const stats = useSampleStore((state) => state.stats);
   const thresholds = useSampleStore((state) => state.thresholds);
+  const activeRelocation = useRelocationStore((state) => state.activePlan);
 
   /** 处置单视图行：拼接组串上下文并判定消缺 / 逾期（派生自 store 明细，保持响应式） */
   const rows: DisposalViewRow[] = useMemo(
     () =>
       disposals.map((disposal) => {
         const string = strings.find((item) => item.id === disposal.stringId);
-        const inverter = string ? inverters.find((item) => item.id === string.inverterId) : undefined;
+        const currentInverterId = disposal.ownerInverterId || string?.inverterId || '';
+        const currentCombinerBox = disposal.ownerCombinerBox || string?.combinerBox || '';
+        const inverter = inverters.find((item) => item.id === currentInverterId);
         const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
         const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
-        const baseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4) : 9.4;
+        const baselineOwner = disposal.baselineOwner ?? {
+          inverterId: currentInverterId,
+          combinerBox: currentCombinerBox,
+        };
+        const baseline =
+          disposal.baselineCurrentA ??
+          baselines[`${baselineOwner.inverterId}::${baselineOwner.combinerBox}`] ??
+          9.4;
         return {
           ...disposal,
           stringCode: string?.code ?? '已删除组串',
-          combinerBox: string?.combinerBox ?? '-',
-          inverterId: inverter?.id ?? '',
+          combinerBox: currentCombinerBox || '-',
+          inverterId: currentInverterId,
           arrayId: array?.id ?? '',
           plantId: plant?.id ?? '',
           plantName: plant?.name ?? '未归属电站',
@@ -190,8 +202,14 @@ export default function DisposalList() {
     if (!retestTarget) return;
     const values = await retestForm.validateFields();
     const cleared = await submitRetest(retestTarget.id, values.retestCurrentA);
-    const string = strings.find((item) => item.id === retestTarget.stringId);
-    const baseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4) : 9.4;
+    const baselineOwner = retestTarget.baselineOwner ?? {
+      inverterId: retestTarget.ownerInverterId,
+      combinerBox: retestTarget.combinerBox,
+    };
+    const baseline =
+      retestTarget.baselineCurrentA ??
+      baselines[`${baselineOwner.inverterId}::${baselineOwner.combinerBox}`] ??
+      9.4;
     if (cleared) {
       message.success(`复测通过，已消缺（基准电流 ${baseline.toFixed(2)} A，达 95% 以上）`);
     } else {
@@ -244,11 +262,21 @@ export default function DisposalList() {
           >
             仅看逾期（{totals.overdue}）
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<PlusOutlined />} disabled={Boolean(activeRelocation)} onClick={openCreate}>
             新建处置单
           </Button>
         </Space>
       </div>
+
+      {activeRelocation ? (
+        <Alert
+          showIcon
+          style={{ marginBottom: 12 }}
+          type={activeRelocation.status === 'failed' ? 'error' : 'warning'}
+          message={activeRelocation.status === 'failed' ? '改挂待恢复，处置派工已冻结' : '整箱改挂冻结中，处置派工已暂停'}
+          description="未完成处置单将在改挂完成后按新归属重派；已复测结论保留原基准。"
+        />
+      ) : null}
 
       <div className="gb-stat-grid">
         <StatBadge title="处置单总数" value={totals.total} suffix="单" color="#0f7b6c" />
@@ -360,6 +388,7 @@ export default function DisposalList() {
                         size="small"
                         type="link"
                         icon={<SendOutlined />}
+                        disabled={Boolean(activeRelocation)}
                         onClick={() => {
                           setAssignTarget(row);
                           assignForm.setFieldsValue({ owner: row.owner, dueDate: dayjs(row.dueDate) });
@@ -372,12 +401,17 @@ export default function DisposalList() {
                       <Button
                         size="small"
                         type="link"
+                        disabled={Boolean(activeRelocation)}
                         onClick={() => {
                           setRetestTarget(row);
-                          const string = strings.find((item) => item.id === row.stringId);
-                          const baseline = string
-                            ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4)
-                            : 9.4;
+                          const baselineOwner = row.baselineOwner ?? {
+                            inverterId: row.ownerInverterId,
+                            combinerBox: row.combinerBox,
+                          };
+                          const baseline =
+                            row.baselineCurrentA ??
+                            baselines[`${baselineOwner.inverterId}::${baselineOwner.combinerBox}`] ??
+                            9.4;
                           retestForm.setFieldsValue({ retestCurrentA: Number(baseline.toFixed(2)) });
                         }}
                       >
@@ -408,7 +442,7 @@ export default function DisposalList() {
                         message.success('处置单已删除');
                       }}
                     >
-                      <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+                      <Button size="small" type="link" danger disabled={Boolean(activeRelocation)} icon={<DeleteOutlined />} />
                     </Popconfirm>
                   </Space>
                 ),

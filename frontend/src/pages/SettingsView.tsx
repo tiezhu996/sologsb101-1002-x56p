@@ -32,6 +32,7 @@ import { usePlantStore } from '../stores/plantStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useSampleStore } from '../stores/sampleStore';
 import { useDisposalStore } from '../stores/disposalStore';
+import { useRelocationStore } from '../stores/relocationStore';
 import {
   DEFAULT_THRESHOLDS,
   validateThresholds,
@@ -67,6 +68,7 @@ export default function SettingsView() {
   const loadPlants = usePlantStore((state) => state.loadPlants);
   const loadDevices = useDeviceStore((state) => state.loadDevices);
   const loadDisposals = useDisposalStore((state) => state.loadDisposals);
+  const loadRelocations = useRelocationStore((state) => state.loadRelocations);
   const disposals = useDisposalStore((state) => state.disposals);
   const strings = useDeviceStore((state) => state.strings);
   const inverters = useDeviceStore((state) => state.inverters);
@@ -137,7 +139,7 @@ export default function SettingsView() {
         cancelText: '取消',
         onOk: async () => {
           await importSnapshot(snapshot);
-          await Promise.all([loadPlants(), loadDevices(), loadSamples(), loadDisposals()]);
+          await Promise.all([loadPlants(), loadDevices(), loadSamples(), loadDisposals(), loadRelocations()]);
           await reloadCounts();
           if (snapshot.thresholds) setThresholds(snapshot.thresholds);
           form.setFieldsValue(snapshot.thresholds ?? DEFAULT_THRESHOLDS);

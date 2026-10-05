@@ -6,6 +6,7 @@ import { create } from 'zustand';
 import {
   ROW_REVISION,
   listDisposals,
+  listSamples,
   listInverters,
   listPlants,
   listArrays,
@@ -17,6 +18,7 @@ import {
   type PlantRow,
   type ArrayRow as DbArrayRow,
   type StringRow,
+  type SampleRow,
 } from '../utils/db';
 import {
   DISPOSAL_STATE_FLOW,
@@ -28,7 +30,7 @@ import {
   type DisposalState,
   type DisposalRow as DisposalViewRow,
 } from '../types/disposal';
-import { mean } from '../utils/discrete';
+import { mean, normalizeCurrent } from '../utils/discrete';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
 
@@ -75,25 +77,37 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
   async loadDisposals() {
     set({ loading: true });
     try {
-      const [disposals, strings, inverters, arrays, plants] = await Promise.all([
+      const [disposals, strings, inverters, arrays, plants, samples] = await Promise.all([
         listDisposals(),
         listStrings(),
         listInverters(),
         listArrays(),
         listPlants(),
+        listSamples(),
       ]);
-      // 基准电流：同一汇流箱内全部组串的处置单初始离散率无法反映电流，改用记录在案的基准
+      // 基准电流：以采集处置侧归属分组，按组串归一化电流均值计算。
       const baselines: Record<string, number> = {};
-      const grouped = new Map<string, number[]>();
+      const grouped = new Map<string, Map<string, SampleRow[]>>();
+      for (const sample of samples) {
+        const ownerKey = `${sample.ownerInverterId}::${sample.ownerCombinerBox}`;
+        let ownerGroup = grouped.get(ownerKey);
+        if (!ownerGroup) {
+          ownerGroup = new Map<string, SampleRow[]>();
+          grouped.set(ownerKey, ownerGroup);
+        }
+        const list = ownerGroup.get(sample.stringId) ?? [];
+        list.push(sample);
+        ownerGroup.set(sample.stringId, list);
+      }
+      for (const [key, byString] of grouped) {
+        const stringAverages = [...byString.values()].map((rows) =>
+          mean(rows.map((row) => normalizeCurrent(row.currentA, row.irradianceWm2))),
+        );
+        baselines[key] = Number(mean(stringAverages).toFixed(3));
+      }
       for (const string of strings) {
         const key = `${string.inverterId}::${string.combinerBox}`;
-        const list = grouped.get(key);
-        if (list) list.push(string.seriesCount);
-        else grouped.set(key, [string.seriesCount]);
-      }
-      for (const [key, seriesCounts] of grouped) {
-        // 用串联数折算典型工作电流 ≈ 9.4A（26 串基准）
-        baselines[key] = Number(((mean(seriesCounts) / 26) * 9.4).toFixed(2));
+        if (baselines[key] === undefined) baselines[key] = Number(((mean([string.seriesCount]) / 26) * 9.4).toFixed(2));
       }
       set({ disposals, strings, inverters, arrays, plants, baselines, loading: false, error: '' });
     } catch (error) {
@@ -114,14 +128,20 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
 
   async createDisposal(draft) {
     const stamp = nowIso();
+    const string = get().strings.find((item) => item.id === draft.stringId);
     const row: DbDisposalRow = {
       id: uuid(),
       stringId: draft.stringId,
+      ownerInverterId: string?.inverterId ?? '',
+      ownerCombinerBox: string?.combinerBox ?? '',
+      originalOwner: string ? { inverterId: string.inverterId, combinerBox: string.combinerBox } : undefined,
       type: draft.type,
       state: 'pending',
       owner: draft.owner.trim(),
       dueDate: draft.dueDate,
       retestCurrentA: null,
+      baselineOwner: null,
+      baselineCurrentA: null,
       initialDiscreteRate: draft.initialDiscreteRate,
       createdAt: stamp,
       updatedAt: stamp,
@@ -149,14 +169,21 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
     const existing = get().disposals.find((item) => item.id === disposalId);
     if (!existing) return null;
     const string = get().strings.find((item) => item.id === existing.stringId);
-    const baseline = string
-      ? (get().baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4)
-      : 9.4;
+    const baselineOwner =
+      existing.baselineOwner ??
+      (string ? { inverterId: existing.ownerInverterId, combinerBox: existing.ownerCombinerBox } : null);
+    const baseline =
+      existing.baselineCurrentA ??
+      (baselineOwner
+        ? (get().baselines[`${baselineOwner.inverterId}::${baselineOwner.combinerBox}`] ?? 9.4)
+        : 9.4);
     const cleared = isCleared(retestCurrentA, baseline);
     await putDisposal({
       ...existing,
       retestCurrentA,
       state: 'retested',
+      baselineOwner,
+      baselineCurrentA: existing.baselineCurrentA ?? baseline,
       updatedAt: nowIso(),
     });
     emitChange();
@@ -185,15 +212,21 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
     const { disposals, strings, inverters, arrays, plants, baselines } = get();
     return disposals.map((disposal) => {
       const string = strings.find((item) => item.id === disposal.stringId);
-      const inverter = string ? inverters.find((item) => item.id === string.inverterId) : undefined;
+      const currentInverterId = disposal.ownerInverterId || string?.inverterId || '';
+      const currentCombinerBox = disposal.ownerCombinerBox || string?.combinerBox || '';
+      const inverter = inverters.find((item) => item.id === currentInverterId);
       const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
       const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
-      const baseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4) : 9.4;
+      const baselineOwner = disposal.baselineOwner ?? {
+        inverterId: currentInverterId,
+        combinerBox: currentCombinerBox,
+      };
+      const baseline = disposal.baselineCurrentA ?? (baselines[`${baselineOwner.inverterId}::${baselineOwner.combinerBox}`] ?? 9.4);
       return {
         ...disposal,
         stringCode: string?.code ?? '已删除组串',
-        combinerBox: string?.combinerBox ?? '-',
-        inverterId: inverter?.id ?? '',
+        combinerBox: currentCombinerBox,
+        inverterId: currentInverterId,
         arrayId: array?.id ?? '',
         plantId: plant?.id ?? '',
         plantName: plant?.name ?? '未归属电站',

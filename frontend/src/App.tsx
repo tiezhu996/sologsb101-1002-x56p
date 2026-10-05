@@ -5,6 +5,7 @@
 import { useEffect } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
+  Alert,
   App as AntdApp,
   Badge,
   Button,
@@ -31,6 +32,7 @@ import { usePlantStore } from './stores/plantStore';
 import { useSampleStore } from './stores/sampleStore';
 import { useDisposalStore } from './stores/disposalStore';
 import { useDeviceStore } from './stores/deviceStore';
+import { useRelocationStore } from './stores/relocationStore';
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -66,6 +68,9 @@ export default function App() {
   const subscribeDisposals = useDisposalStore((state) => state.subscribe);
   const loadDevices = useDeviceStore((state) => state.loadDevices);
   const subscribeDevices = useDeviceStore((state) => state.subscribe);
+  const loadRelocations = useRelocationStore((state) => state.loadRelocations);
+  const subscribeRelocations = useRelocationStore((state) => state.subscribe);
+  const activeRelocation = useRelocationStore((state) => state.activePlan);
 
   const stats = useSampleStore((state) => state.stats);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
@@ -81,12 +86,23 @@ export default function App() {
       subscribeSamples();
       subscribeDisposals();
       subscribeDevices();
-      await Promise.all([loadSamples(), loadDisposals(), loadDevices()]);
+      subscribeRelocations();
+      await Promise.all([loadSamples(), loadDisposals(), loadDevices(), loadRelocations()]);
     })();
     return () => {
       cancelled = true;
     };
-  }, [bootstrap, loadSamples, loadDisposals, loadDevices, subscribeSamples, subscribeDisposals, subscribeDevices]);
+  }, [
+    bootstrap,
+    loadSamples,
+    loadDisposals,
+    loadDevices,
+    loadRelocations,
+    subscribeSamples,
+    subscribeDisposals,
+    subscribeDevices,
+    subscribeRelocations,
+  ]);
 
   useEffect(() => {
     if (plantError) message.error(`本地数据库异常：${plantError}`);
@@ -185,6 +201,19 @@ export default function App() {
         </Header>
 
         <Content style={{ padding: 18, minHeight: 320 }}>
+          {activeRelocation ? (
+            <Alert
+              showIcon
+              type={activeRelocation.status === 'failed' ? 'error' : 'warning'}
+              style={{ marginBottom: 12 }}
+              message={
+                activeRelocation.status === 'failed'
+                  ? `整箱改挂写入失败，已恢复设备归属：${activeRelocation.lastError}`
+                  : '整箱改挂冻结中：设备台账、采集录入与处置派工已暂停'
+              }
+              description={`${activeRelocation.sourceCombinerBox} → 新设备 ${activeRelocation.targetInverterId} / ${activeRelocation.targetCombinerBox}，已确认 ${activeRelocation.stringCount} 串；重试不会重复搬迁。`}
+            />
+          ) : null}
           <Outlet />
         </Content>
 

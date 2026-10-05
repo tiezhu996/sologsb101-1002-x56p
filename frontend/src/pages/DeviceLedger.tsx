@@ -4,6 +4,7 @@
  */
 import { useMemo, useState } from 'react';
 import {
+  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -13,6 +14,7 @@ import {
   Form,
   Input,
   InputNumber,
+  Modal,
   Popconfirm,
   Row,
   Select,
@@ -28,15 +30,18 @@ import {
   DeleteOutlined,
   EditOutlined,
   PlusOutlined,
+  SwapOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import { useDeviceStore } from '../stores/deviceStore';
 import { usePlantStore } from '../stores/plantStore';
 import { useSampleStore } from '../stores/sampleStore';
+import { useRelocationStore } from '../stores/relocationStore';
 import type { InverterDraft } from '../types/inverter';
 import { inverterHealth, serviceYears, stringsPerMppt } from '../types/inverter';
 import type { BatchStringDraft, StringDraft } from '../types/string';
+import type { RelocationDraft, RelocationPlan } from '../types/relocation';
 import { expectedVoc } from '../types/string';
 import type { InverterLedgerRow } from '../types/inverter';
 import type { InverterRow, StringRow } from '../utils/db';
@@ -62,6 +67,13 @@ interface StringFormValues {
   seriesCount: number;
 }
 
+interface RelocationFormValues {
+  sourceCombinerBox: string;
+  targetInverterId: string;
+  targetCombinerBox: string;
+  reason: string;
+}
+
 export default function DeviceLedger() {
   const { message } = AntdApp.useApp();
   const plants = useDeviceStore((state) => state.plants);
@@ -85,12 +97,25 @@ export default function DeviceLedger() {
   const activePlantId = usePlantStore((state) => state.activePlantId);
   const stats = useSampleStore((state) => state.stats);
   const thresholds = useSampleStore((state) => state.thresholds);
+  const remarkAfterRelocation = useSampleStore((state) => state.remarkAfterRelocation);
+  const activeRelocation = useRelocationStore((state) => state.activePlan);
+  const freezeRelocation = useRelocationStore((state) => state.freeze);
+  const executeRelocation = useRelocationStore((state) => state.execute);
+  const cancelRelocation = useRelocationStore((state) => state.cancel);
 
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['plant', 'state']);
   const [inverterForm] = Form.useForm<InverterFormValues>();
   const [stringForm] = Form.useForm<StringFormValues>();
   const [batchForm] = Form.useForm<{ combinerBox: string; moduleModel: string; seriesCount: number; startSeq: number; count: number }>();
+  const [relocationForm] = Form.useForm<RelocationFormValues>();
+  const [relocationModal, setRelocationModal] = useState<{ open: boolean; sourceInverterId: string; sourceCombinerBox: string }>({
+    open: false,
+    sourceInverterId: '',
+    sourceCombinerBox: '',
+  });
+  const [frozenRelocationPlan, setFrozenRelocationPlan] = useState<RelocationPlan | null>(null);
+  const [relocationSubmitting, setRelocationSubmitting] = useState(false);
   const [inverterModal, setInverterModal] = useState<{ open: boolean; editing: InverterRow | null }>({
     open: false,
     editing: null,
@@ -274,6 +299,98 @@ export default function DeviceLedger() {
 
   const drawerInverter = inverters.find((item) => item.id === stringDrawer.inverterId) ?? null;
 
+  const openRelocationModal = (sourceInverterId: string, sourceCombinerBox = ''): void => {
+    setFrozenRelocationPlan(null);
+    setRelocationModal({ open: true, sourceInverterId, sourceCombinerBox });
+    relocationForm.resetFields();
+    relocationForm.setFieldsValue({
+      sourceCombinerBox,
+      targetInverterId: inverters.find((item) => item.id !== sourceInverterId)?.id,
+      targetCombinerBox: sourceCombinerBox || 'BX-01',
+      reason: '旧逆变器退运，整箱组串改挂新设备',
+    });
+  };
+
+  const submitRelocation = async (): Promise<void> => {
+    const values = await relocationForm.validateFields();
+    const draft: RelocationDraft = {
+      sourceInverterId: relocationModal.sourceInverterId,
+      sourceCombinerBox: values.sourceCombinerBox,
+      targetInverterId: values.targetInverterId,
+      targetCombinerBox: values.targetCombinerBox,
+      reason: values.reason,
+    };
+    setRelocationSubmitting(true);
+    try {
+      const plan = await freezeRelocation(draft);
+      setFrozenRelocationPlan(plan);
+      message.success(`已冻结并核对 ${plan.stringCount} 串，请确认后搬迁`);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '冻结核对失败');
+    } finally {
+      setRelocationSubmitting(false);
+    }
+  };
+
+  const executeFrozenRelocation = async (): Promise<void> => {
+    const plan = frozenRelocationPlan ?? activeRelocation;
+    if (!plan) return;
+    setRelocationSubmitting(true);
+    try {
+      const result = await executeRelocation(plan.id);
+      remarkAfterRelocation(plan.confirmedStringIds, result.suspiciousStringIds);
+      message.success(`已改挂 ${result.relocatedStringIds.length} 串，重派 ${result.reassignedDisposalIds.length} 张处置单`);
+      setRelocationModal({ open: false, sourceInverterId: '', sourceCombinerBox: '' });
+      setFrozenRelocationPlan(null);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '整箱改挂失败');
+    } finally {
+      setRelocationSubmitting(false);
+    }
+  };
+
+  const retryActiveRelocation = (): void => {
+    if (!activeRelocation) return;
+    setFrozenRelocationPlan(activeRelocation);
+    setRelocationModal({
+      open: true,
+      sourceInverterId: activeRelocation.sourceInverterId,
+      sourceCombinerBox: activeRelocation.sourceCombinerBox,
+    });
+    relocationForm.setFieldsValue({
+      sourceCombinerBox: activeRelocation.sourceCombinerBox,
+      targetInverterId: activeRelocation.targetInverterId,
+      targetCombinerBox: activeRelocation.targetCombinerBox,
+      reason: activeRelocation.reason,
+    });
+  };
+
+  const cancelActiveRelocation = async (): Promise<void> => {
+    if (!activeRelocation) return;
+    await cancelRelocation(activeRelocation.id);
+    message.success('已解除冻结');
+  };
+
+  const closeRelocationModal = async (): Promise<void> => {
+    const plan = frozenRelocationPlan ?? activeRelocation;
+    if (plan && (plan.status === 'frozen' || plan.status === 'failed')) {
+      await cancelRelocation(plan.id);
+      message.info('已取消计划并解除冻结');
+    }
+    setFrozenRelocationPlan(null);
+    setRelocationModal({ open: false, sourceInverterId: '', sourceCombinerBox: '' });
+  };
+
+  const relocationSourceRows = useMemo(() => {
+    if (!activeRelocation) return [];
+    const source = inverters.find((item) => item.id === activeRelocation.sourceInverterId);
+    const target = inverters.find((item) => item.id === activeRelocation.targetInverterId);
+    return [
+      { label: '源逆变器', value: source ? `${source.model} / ${activeRelocation.sourceCombinerBox}` : activeRelocation.sourceInverterId },
+      { label: '目标逆变器', value: target ? `${target.model} / ${activeRelocation.targetCombinerBox}` : activeRelocation.targetInverterId },
+    ];
+  }, [activeRelocation, inverters]);
+
   return (
     <div>
       <div className="gb-page-head">
@@ -295,6 +412,37 @@ export default function DeviceLedger() {
           </Button>
         </Space>
       </div>
+
+      {activeRelocation ? (
+        <Alert
+          showIcon
+          style={{ marginBottom: 12 }}
+          type={activeRelocation.status === 'failed' ? 'error' : 'warning'}
+          message={
+            activeRelocation.status === 'failed'
+              ? '改挂写入失败，设备归属已恢复；可按已确认范围重试'
+              : '改挂冻结中，台账录入、采集录入与处置派工均已暂停'
+          }
+          description={
+            <Space wrap>
+              {relocationSourceRows.map((item) => (
+                <Tag key={item.label}>{item.label}：{item.value}</Tag>
+              ))}
+              <Tag color="blue">已核对 {activeRelocation.stringCount} 串</Tag>
+              <Tag color="orange">未完成单 {activeRelocation.unfinishedDisposalCount} 张</Tag>
+              <Tag>已复测 {activeRelocation.retestedDisposalCount} 张保留原基准</Tag>
+              {activeRelocation.status === 'failed' ? (
+                <Button size="small" type="primary" loading={relocationSubmitting} onClick={retryActiveRelocation}>
+                  重试（不重复搬迁）
+                </Button>
+              ) : null}
+              <Popconfirm title="取消该冻结计划？" okText="取消冻结" cancelText="继续冻结" onConfirm={() => void cancelActiveRelocation()}>
+                <Button size="small">解除冻结</Button>
+              </Popconfirm>
+            </Space>
+          }
+        />
+      ) : null}
 
       <div className="gb-stat-grid">
         <StatBadge title="逆变器台数" value={totals.inverters} suffix="台" color="#0f7b6c" />
@@ -412,12 +560,21 @@ export default function DeviceLedger() {
                   },
                   {
                     title: '操作',
-                    width: 200,
+                    width: 250,
                     fixed: 'right',
                     render: (_, row) => (
                       <Space size={2}>
                         <Button size="small" type="link" onClick={() => openStringDrawer(row.id, null)}>
                           组串
+                        </Button>
+                        <Button
+                          size="small"
+                          type="link"
+                          icon={<SwapOutlined />}
+                          disabled={Boolean(activeRelocation)}
+                          onClick={() => openRelocationModal(row.id, row.boxCodes[0] ?? '')}
+                        >
+                          整箱改挂
                         </Button>
                         <Button
                           size="small"
@@ -491,6 +648,66 @@ export default function DeviceLedger() {
           </Card>
         </Col>
       </Row>
+
+      {/* 整箱改挂 */}
+      <Modal
+        title={frozenRelocationPlan ? '冻结核对完成 · 确认搬迁' : '旧逆变器退运 · 整箱组串改挂'}
+        open={relocationModal.open}
+        onCancel={() => void closeRelocationModal()}
+        onOk={() => void (frozenRelocationPlan ? executeFrozenRelocation() : submitRelocation())}
+        confirmLoading={relocationSubmitting}
+        okText={frozenRelocationPlan ? '确认搬迁' : '冻结核对'}
+        cancelText={frozenRelocationPlan ? '取消并解冻' : '取消'}
+      >
+        {frozenRelocationPlan ? (
+          <Alert
+            showIcon
+            type="success"
+            style={{ marginBottom: 12 }}
+            message={`已冻结两端录入与派工，箱内 ${frozenRelocationPlan.stringCount} 串及采集/处置归属核对一致`}
+            description={`未完成处置单 ${frozenRelocationPlan.unfinishedDisposalCount} 张将按新归属重派；已复测 ${frozenRelocationPlan.retestedDisposalCount} 张保留原基准。`}
+          />
+        ) : (
+          <Alert
+            showIcon
+            type="info"
+            style={{ marginBottom: 12 }}
+            message="提交后先冻结两端录入与派工，核对箱内组串和采集/处置归属；确认范围后再搬迁。"
+          />
+        )}
+        <Form form={relocationForm} layout="vertical" disabled={Boolean(frozenRelocationPlan)}>
+          <Form.Item name="sourceCombinerBox" label="源汇流箱" rules={[{ required: true, message: '请选择源汇流箱' }]}>
+            <Select
+              options={[...new Set(strings.filter((item) => item.inverterId === relocationModal.sourceInverterId).map((item) => item.combinerBox))].map((box) => ({ label: box, value: box }))}
+            />
+          </Form.Item>
+          <Form.Item name="targetInverterId" label="新逆变器" rules={[{ required: true, message: '请选择新逆变器' }]}>
+            <Select
+              showSearch
+              optionFilterProp="label"
+              options={inverters
+                .filter((item) => item.id !== relocationModal.sourceInverterId)
+                .map((item) => {
+                  const array = arrays.find((arrayRow) => arrayRow.id === item.arrayId);
+                  const plant = array ? plants.find((plantRow) => plantRow.id === array.plantId) : undefined;
+                  return {
+                    label: `${item.model} · ${plant?.name ?? '未归属电站'} / ${array?.code ?? '-'}`,
+                    value: item.id,
+                  };
+                })}
+            />
+          </Form.Item>
+          <Form.Item name="targetCombinerBox" label="目标汇流箱编号" rules={[{ required: true, message: '请输入目标汇流箱编号' }]}>
+            <Input placeholder="默认沿用源汇流箱编号，目标箱必须为空" />
+          </Form.Item>
+          <Form.Item name="reason" label="改挂原因">
+            <Input.TextArea rows={2} />
+          </Form.Item>
+        </Form>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+          未完成处置单将按新归属重派；已复测结论保留原基准。失败会恢复设备归属，重试不重复搬迁。
+        </Typography.Paragraph>
+      </Modal>
 
       {/* 逆变器表单 */}
       <Drawer
