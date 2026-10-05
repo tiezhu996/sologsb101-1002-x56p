@@ -17,6 +17,7 @@ const DeviceLedger = lazy(() => import('../pages/DeviceLedger'));
 const SampleEntry = lazy(() => import('../pages/SampleEntry'));
 const DiagnoseBoard = lazy(() => import('../pages/DiagnoseBoard'));
 const DisposalList = lazy(() => import('../pages/DisposalList'));
+const MigrationWorkbench = lazy(() => import('../pages/MigrationWorkbench'));
 const SettingsView = lazy(() => import('../pages/SettingsView'));
 
 /** 兼容出口：路径常量请优先直接从 './routes' 引入（叶子模块，不产生环） */
@@ -48,6 +49,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'samples', element: withSuspense(<SampleEntry />) },
       { path: 'diagnose', element: withSuspense(<DiagnoseBoard />) },
       { path: 'disposals', element: withSuspense(<DisposalList />) },
+      { path: 'migration', element: withSuspense(<MigrationWorkbench />) },
       { path: 'settings', element: withSuspense(<SettingsView />) },
       { path: '*', element: <Navigate to={ROUTES.plants} replace /> },
     ],

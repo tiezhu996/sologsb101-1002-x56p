@@ -40,6 +40,14 @@ export interface Disposal {
   dueDate: string;
   /** 复测电流（A），已复测时必填 */
   retestCurrentA: number | null;
+  /**
+   * 复测判定时的基准电流（A）。
+   * 已复测单在整箱改挂后仍按该基准保留结论（新汇流箱基准变化不改写历史判定）。
+   * v3 升级旧数据时按原汇流箱（originInverterId+originCombinerBox）基准回填。
+   */
+  baselineCurrentA: number | null;
+  /** 改挂后按新归属重派的次数（每次未完成单回到待处理时 +1） */
+  redispatchCount: number;
   /** 派工时登记的初始离散率（%） */
   initialDiscreteRate: number;
   createdAt: string;

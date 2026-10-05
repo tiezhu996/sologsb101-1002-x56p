@@ -26,6 +26,7 @@ import { DEFAULT_THRESHOLDS } from '../types/settings';
 import { buildStringStats, discreteRate, normalizeCurrent } from '../utils/discrete';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
+import { assertWritable } from './migrationStore';
 
 interface SampleStoreState {
   samples: SampleRow[];
@@ -143,6 +144,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async addSample(draft) {
+    assertWritable();
     const row: SampleRow = {
       id: uuid(),
       stringId: draft.stringId,
@@ -162,6 +164,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async addBatchSamples(drafts) {
+    assertWritable();
     const rows: SampleRow[] = [];
     for (const draft of drafts) {
       rows.push({
@@ -188,6 +191,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async updateSample(sampleId, draft) {
+    assertWritable();
     const existing = get().samples.find((item) => item.id === sampleId);
     if (!existing) return;
     await putSample({
@@ -203,6 +207,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async deleteSample(sampleId) {
+    assertWritable();
     const existing = get().samples.find((item) => item.id === sampleId);
     await removeSample(sampleId);
     if (existing) await get().recalcDiscreteRate(existing.stringId);
@@ -210,6 +215,7 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   async deleteSamplesOfString(stringId) {
+    assertWritable();
     const rows = get().samples.filter((item) => item.stringId === stringId);
     for (const row of rows) {
       await removeSample(row.id);

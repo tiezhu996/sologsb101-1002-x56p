@@ -22,7 +22,9 @@ import {
   DatabaseOutlined,
   ExperimentOutlined,
   FileProtectOutlined,
+  LockOutlined,
   SettingOutlined,
+  SwapOutlined,
 } from '@ant-design/icons';
 // 路径常量取自叶子模块 ./router/routes：App 在模块顶层就要用 ROUTES 构造菜单，
 // 若从 ./router（会 import App）引入会形成循环依赖 → TDZ「Cannot access before initialization」
@@ -31,6 +33,7 @@ import { usePlantStore } from './stores/plantStore';
 import { useSampleStore } from './stores/sampleStore';
 import { useDisposalStore } from './stores/disposalStore';
 import { useDeviceStore } from './stores/deviceStore';
+import { useMigrationStore } from './stores/migrationStore';
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -40,6 +43,7 @@ const MENU_ITEMS = [
   { key: ROUTES.samples, icon: <ExperimentOutlined />, label: '采集与离散率' },
   { key: ROUTES.diagnose, icon: <AlertOutlined />, label: '失配排查工作台' },
   { key: ROUTES.disposals, icon: <FileProtectOutlined />, label: '处置单' },
+  { key: ROUTES.migration, icon: <SwapOutlined />, label: '整箱改挂' },
   { key: ROUTES.settings, icon: <SettingOutlined />, label: '阈值与版本' },
 ];
 
@@ -66,6 +70,9 @@ export default function App() {
   const subscribeDisposals = useDisposalStore((state) => state.subscribe);
   const loadDevices = useDeviceStore((state) => state.loadDevices);
   const subscribeDevices = useDeviceStore((state) => state.subscribe);
+  const loadMigration = useMigrationStore((state) => state.loadMigrationState);
+  const subscribeMigration = useMigrationStore((state) => state.subscribe);
+  const frozen = useMigrationStore((state) => state.freeze?.frozen === true);
 
   const stats = useSampleStore((state) => state.stats);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
@@ -81,12 +88,23 @@ export default function App() {
       subscribeSamples();
       subscribeDisposals();
       subscribeDevices();
-      await Promise.all([loadSamples(), loadDisposals(), loadDevices()]);
+      subscribeMigration();
+      await Promise.all([loadSamples(), loadDisposals(), loadDevices(), loadMigration()]);
     })();
     return () => {
       cancelled = true;
     };
-  }, [bootstrap, loadSamples, loadDisposals, loadDevices, subscribeSamples, subscribeDisposals, subscribeDevices]);
+  }, [
+    bootstrap,
+    loadSamples,
+    loadDisposals,
+    loadDevices,
+    loadMigration,
+    subscribeSamples,
+    subscribeDisposals,
+    subscribeDevices,
+    subscribeMigration,
+  ]);
 
   useEffect(() => {
     if (plantError) message.error(`本地数据库异常：${plantError}`);
@@ -172,6 +190,17 @@ export default function App() {
             )}
           </Space>
           <Space wrap>
+            {frozen ? (
+              <Button
+                size="small"
+                danger
+                type="primary"
+                icon={<LockOutlined />}
+                onClick={() => navigate(ROUTES.migration)}
+              >
+                改挂冻结中
+              </Button>
+            ) : null}
             <Badge count={mismatchCount} showZero color="#a8071a" title="失配组串数">
               <Tag color="#a8071a">失配组串</Tag>
             </Badge>

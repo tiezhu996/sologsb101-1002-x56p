@@ -39,7 +39,9 @@ import { shiftDate } from '../utils/format';
 import DiscreteBadge from '../components/common/DiscreteBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
+import FreezeBanner from '../components/common/FreezeBanner';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
+import { useMigrationStore } from '../stores/migrationStore';
 
 type SortKey = 'score' | 'discrete' | 'bias';
 
@@ -59,6 +61,7 @@ export default function DiagnoseBoard() {
   const inverters = useDeviceStore((state) => state.inverters);
   const arrays = useDeviceStore((state) => state.arrays);
   const strings = useDeviceStore((state) => state.strings);
+  const frozen = useMigrationStore((state) => state.freeze?.frozen === true);
 
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['plant', 'inverter', 'level']);
@@ -189,13 +192,15 @@ export default function DiagnoseBoard() {
           <Button
             type="primary"
             icon={<FileProtectOutlined />}
-            disabled={selectedIds.length === 0}
+            disabled={selectedIds.length === 0 || frozen}
             onClick={() => void createForSelected()}
           >
             批量派单（{selectedIds.length}）
           </Button>
         </Space>
       </div>
+
+      <FreezeBanner scope="处置单新建与派工（人工标记仍可用）" />
 
       <div className="gb-stat-grid">
         <StatBadge title="在册组串" value={totals.total} suffix="串" color="#0f7b6c" />
@@ -359,6 +364,7 @@ export default function DiagnoseBoard() {
                         <Button
                           size="small"
                           type="link"
+                          disabled={frozen}
                           onClick={async () => {
                             if (openDisposalsOf(row.stringId) > 0) {
                               message.warning('该组串已有未闭环处置单');
@@ -606,6 +612,7 @@ export default function DiagnoseBoard() {
               <Button
                 type="primary"
                 icon={<LineChartOutlined />}
+                disabled={frozen}
                 onClick={() => {
                   void createDisposal({
                     stringId: target.stringId,

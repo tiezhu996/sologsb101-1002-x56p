@@ -31,6 +31,7 @@ import {
 import { mean } from '../utils/discrete';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
+import { assertWritable } from './migrationStore';
 
 interface DisposalStoreState {
   disposals: DbDisposalRow[];
@@ -113,6 +114,7 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
   },
 
   async createDisposal(draft) {
+    assertWritable();
     const stamp = nowIso();
     const row: DbDisposalRow = {
       id: uuid(),
@@ -122,6 +124,8 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
       owner: draft.owner.trim(),
       dueDate: draft.dueDate,
       retestCurrentA: null,
+      baselineCurrentA: null,
+      redispatchCount: 0,
       initialDiscreteRate: draft.initialDiscreteRate,
       createdAt: stamp,
       updatedAt: stamp,
@@ -133,6 +137,7 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
   },
 
   async assignDisposal(disposalId, owner, dueDate) {
+    assertWritable();
     const existing = get().disposals.find((item) => item.id === disposalId);
     if (!existing) return;
     await putDisposal({
@@ -146,16 +151,21 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
   },
 
   async submitRetest(disposalId, retestCurrentA) {
+    // 复测回填不在冻结禁止之列：不改归属，且是保留原基准结论的唯一入口
     const existing = get().disposals.find((item) => item.id === disposalId);
     if (!existing) return null;
     const string = get().strings.find((item) => item.id === existing.stringId);
-    const baseline = string
+    const dynamicBaseline = string
       ? (get().baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4)
       : 9.4;
+    // 复测当时的基准电流随结论一起固化；后续整箱改挂不改写
+    const baseline =
+      typeof existing.baselineCurrentA === 'number' ? existing.baselineCurrentA : dynamicBaseline;
     const cleared = isCleared(retestCurrentA, baseline);
     await putDisposal({
       ...existing,
       retestCurrentA,
+      baselineCurrentA: baseline,
       state: 'retested',
       updatedAt: nowIso(),
     });
@@ -164,6 +174,7 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
   },
 
   async changeState(disposalId, state) {
+    assertWritable();
     const existing = get().disposals.find((item) => item.id === disposalId);
     if (!existing) return;
     const allowed = DISPOSAL_STATE_FLOW[existing.state];
@@ -173,6 +184,7 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
   },
 
   async deleteDisposal(disposalId) {
+    assertWritable();
     await removeDisposal(disposalId);
     emitChange();
   },
@@ -188,7 +200,14 @@ export const useDisposalStore = create<DisposalStoreState>((set, get) => ({
       const inverter = string ? inverters.find((item) => item.id === string.inverterId) : undefined;
       const array = inverter ? arrays.find((item) => item.id === inverter.arrayId) : undefined;
       const plant = array ? plants.find((item) => item.id === array.plantId) : undefined;
-      const baseline = string ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4) : 9.4;
+      const dynamicBaseline = string
+        ? (baselines[`${string.inverterId}::${string.combinerBox}`] ?? 9.4)
+        : 9.4;
+      // 已复测结论保留原基准：改挂后仍按复测当时固化的基准判定
+      const baseline =
+        disposal.state === 'retested' && typeof disposal.baselineCurrentA === 'number'
+          ? disposal.baselineCurrentA
+          : dynamicBaseline;
       return {
         ...disposal,
         stringCode: string?.code ?? '已删除组串',

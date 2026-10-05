@@ -49,6 +49,8 @@ import { formatCurrent, share } from '../utils/unit';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
 import DiscreteBadge from '../components/common/DiscreteBadge';
+import FreezeBanner from '../components/common/FreezeBanner';
+import { useMigrationStore } from '../stores/migrationStore';
 
 const STATE_COLOR: Record<DisposalState, string> = {
   pending: 'default',
@@ -73,6 +75,7 @@ export default function DisposalList() {
   const plants = useDeviceStore((state) => state.plants);
   const stats = useSampleStore((state) => state.stats);
   const thresholds = useSampleStore((state) => state.thresholds);
+  const frozen = useMigrationStore((state) => state.freeze?.frozen === true);
 
   /** 处置单视图行：拼接组串上下文并判定消缺 / 逾期（派生自 store 明细，保持响应式） */
   const rows: DisposalViewRow[] = useMemo(
@@ -244,11 +247,13 @@ export default function DisposalList() {
           >
             仅看逾期（{totals.overdue}）
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<PlusOutlined />} disabled={frozen} onClick={openCreate}>
             新建处置单
           </Button>
         </Space>
       </div>
+
+      <FreezeBanner scope="处置单新建、派工与删除（复测回填仍开放，结论保留原基准）" />
 
       <div className="gb-stat-grid">
         <StatBadge title="处置单总数" value={totals.total} suffix="单" color="#0f7b6c" />
@@ -277,9 +282,9 @@ export default function DisposalList() {
             title="没有匹配的处置单"
             description="可新建处置单，或在失配排查工作台批量派单。"
             createLabel="新建处置单"
+            createDisabled={frozen}
             onCreate={openCreate}
-          />
-        ) : (
+          />        ) : (
           <Table<DisposalViewRow>
             rowKey="id"
             size="small"
@@ -300,11 +305,12 @@ export default function DisposalList() {
               {
                 title: '状态',
                 dataIndex: 'state',
-                width: 110,
+                width: 130,
                 render: (value: DisposalState, row) => (
-                  <Space size={4}>
+                  <Space size={4} wrap>
                     <Tag color={STATE_COLOR[value]}>{DISPOSAL_STATE_LABEL[value]}</Tag>
                     {row.overdue ? <Tag color="red">逾期</Tag> : null}
+                    {row.redispatchCount > 0 ? <Tag color="geekblue">重派 {row.redispatchCount}</Tag> : null}
                   </Space>
                 ),
               },
@@ -360,6 +366,7 @@ export default function DisposalList() {
                         size="small"
                         type="link"
                         icon={<SendOutlined />}
+                        disabled={frozen}
                         onClick={() => {
                           setAssignTarget(row);
                           assignForm.setFieldsValue({ owner: row.owner, dueDate: dayjs(row.dueDate) });
@@ -403,12 +410,13 @@ export default function DisposalList() {
                       title="删除该处置单？"
                       okText="删除"
                       cancelText="取消"
+                      disabled={frozen}
                       onConfirm={async () => {
                         await deleteDisposal(row.id);
                         message.success('处置单已删除');
                       }}
                     >
-                      <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+                      <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={frozen} />
                     </Popconfirm>
                   </Space>
                 ),
@@ -456,7 +464,7 @@ export default function DisposalList() {
         extra={
           <Space>
             <Button onClick={() => setCreateOpen(false)}>取消</Button>
-            <Button type="primary" onClick={() => void submitCreate()}>
+            <Button type="primary" disabled={frozen} onClick={() => void submitCreate()}>
               创建
             </Button>
           </Space>
@@ -504,7 +512,7 @@ export default function DisposalList() {
         extra={
           <Space>
             <Button onClick={() => setAssignTarget(null)}>取消</Button>
-            <Button type="primary" onClick={() => void submitAssign()}>
+            <Button type="primary" disabled={frozen} onClick={() => void submitAssign()}>
               确认派工
             </Button>
           </Space>

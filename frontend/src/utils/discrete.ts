@@ -168,6 +168,52 @@ export function rebaseBias(
   });
 }
 
+/**
+ * 按汇流箱分组重算离散率（纯计算，不触库）。
+ * 入参为当前全部组串与全部采集，受影响分组键形如 `${inverterId}::${combinerBox}`。
+ * 返回离散率被改写、需要落库的采集记录与实际存在数据的受影响分组键。
+ *
+ * 口径与 sampleStore.recalcDiscreteRate 完全一致：同一逆变器+汇流箱内全部组串
+ * 互为基准，归一化电流合并计算一个箱级离散率，回写箱内全部采集记录。
+ */
+export function recalcGroups<T extends Sample>(
+  allStrings: Array<{ id: string; inverterId: string; combinerBox: string }>,
+  allSamples: T[],
+  affectedGroupKeys: string[],
+): { updated: T[]; affectedKeys: string[] } {
+  const wanted = new Set(affectedGroupKeys.filter(Boolean));
+  if (wanted.size === 0) return { updated: [], affectedKeys: [] };
+  const ownerOf = new Map(allStrings.map((item) => [item.id, item]));
+  const byGroup = new Map<string, T[]>();
+  for (const sample of allSamples) {
+    const owner = ownerOf.get(sample.stringId);
+    if (!owner) continue;
+    const key = groupKeyOf(owner);
+    if (!wanted.has(key)) continue;
+    const list = byGroup.get(key);
+    if (list) list.push(sample);
+    else byGroup.set(key, [sample]);
+  }
+  const updated: T[] = [];
+  for (const [, list] of byGroup) {
+    const values = list.slice(-40).map((item) => normalizeCurrent(item.currentA, item.irradianceWm2));
+    const rate = discreteRate(values.length > 0 ? values : [0]);
+    for (const item of list) {
+      if (item.discreteRate !== rate) updated.push({ ...item, discreteRate: rate });
+    }
+  }
+  return { updated, affectedKeys: [...byGroup.keys()] };
+}
+
+/**
+ * 汇流箱基准电流（A）：以组串串联数折算典型工作电流，26 串约 9.4 A。
+ * 与 disposalStore.baselines 口径一致；处置单复测结论按复测当时的基准固化。
+ */
+export function boxBaselineCurrent(seriesCounts: number[]): number {
+  if (seriesCounts.length === 0) return 9.4;
+  return Number(((mean(seriesCounts) / 26) * 9.4).toFixed(2));
+}
+
 /** 离散率 → 颜色（供表格内联样式复用） */
 export const DISCRETE_COLOR: Record<DiscreteLevel, string> = {
   normal: '#237804',

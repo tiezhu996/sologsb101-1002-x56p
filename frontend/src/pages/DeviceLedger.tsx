@@ -44,8 +44,10 @@ import { formatCurrent, formatVoltage, share } from '../utils/unit';
 import DiscreteBadge from '../components/common/DiscreteBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
+import FreezeBanner from '../components/common/FreezeBanner';
 import FilterBar, { useKeywordFilter } from '../components/common/FilterBar';
 import { useFilterValues } from '../components/common/FilterBar';
+import { useMigrationStore } from '../stores/migrationStore';
 
 interface InverterFormValues {
   arrayId: string;
@@ -85,6 +87,7 @@ export default function DeviceLedger() {
   const activePlantId = usePlantStore((state) => state.activePlantId);
   const stats = useSampleStore((state) => state.stats);
   const thresholds = useSampleStore((state) => state.thresholds);
+  const frozen = useMigrationStore((state) => state.freeze?.frozen === true);
 
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['plant', 'state']);
@@ -290,11 +293,13 @@ export default function DeviceLedger() {
             展开全部
           </Button>
           <Button onClick={collapseAll}>收起全部</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => openInverterModal(null)}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => openInverterModal(null)} disabled={frozen}>
             新增逆变器
           </Button>
         </Space>
       </div>
+
+      <FreezeBanner scope="逆变器 / 组串的新增、编辑与删除" />
 
       <div className="gb-stat-grid">
         <StatBadge title="逆变器台数" value={totals.inverters} suffix="台" color="#0f7b6c" />
@@ -416,25 +421,27 @@ export default function DeviceLedger() {
                     fixed: 'right',
                     render: (_, row) => (
                       <Space size={2}>
-                        <Button size="small" type="link" onClick={() => openStringDrawer(row.id, null)}>
+                        <Button size="small" type="link" onClick={() => openStringDrawer(row.id, null)} disabled={frozen}>
                           组串
                         </Button>
                         <Button
                           size="small"
                           type="link"
                           icon={<EditOutlined />}
+                          disabled={frozen}
                           onClick={() => openInverterModal(row)}
                         />
                         <Popconfirm
                           title="删除该逆变器及其全部组串与采集数据？"
                           okText="删除"
                           cancelText="取消"
+                          disabled={frozen}
                           onConfirm={async () => {
                             await deleteInverter(row.id);
                             message.success('逆变器已删除');
                           }}
                         >
-                          <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+                          <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={frozen} />
                         </Popconfirm>
                       </Space>
                     ),
@@ -501,7 +508,7 @@ export default function DeviceLedger() {
         extra={
           <Space>
             <Button onClick={() => setInverterModal({ open: false, editing: null })}>取消</Button>
-            <Button type="primary" onClick={() => void submitInverter()}>
+            <Button type="primary" disabled={frozen} onClick={() => void submitInverter()}>
               保存
             </Button>
           </Space>
@@ -559,7 +566,7 @@ export default function DeviceLedger() {
                   <InputNumber min={1} max={60} style={{ width: '100%' }} />
                 </Form.Item>
                 <Space>
-                  <Button type="primary" htmlType="submit" icon={<PlusOutlined />}>
+                  <Button type="primary" htmlType="submit" icon={<PlusOutlined />} disabled={frozen}>
                     {stringDrawer.editing ? '保存修改' : '新增组串'}
                   </Button>
                   {stringDrawer.editing ? (
@@ -600,7 +607,7 @@ export default function DeviceLedger() {
                     </Form.Item>
                   </Col>
                 </Row>
-                <Button type="primary" htmlType="submit" icon={<ThunderboltOutlined />}>
+                <Button type="primary" htmlType="submit" icon={<ThunderboltOutlined />} disabled={frozen}>
                   批量生成组串
                 </Button>
               </Form>
@@ -643,19 +650,20 @@ export default function DeviceLedger() {
               width: 130,
               render: (_, row) => (
                 <Space size={2}>
-                  <Button size="small" type="link" onClick={() => openStringDrawer(row.inverterId, row)}>
+                  <Button size="small" type="link" disabled={frozen} onClick={() => openStringDrawer(row.inverterId, row)}>
                     编辑
                   </Button>
                   <Popconfirm
                     title="删除该组串及其采集与处置单？"
                     okText="删除"
                     cancelText="取消"
+                    disabled={frozen}
                     onConfirm={async () => {
                       await deleteString(row.id);
                       message.success('组串已删除');
                     }}
                   >
-                    <Button size="small" type="link" danger>
+                    <Button size="small" type="link" danger disabled={frozen}>
                       删除
                     </Button>
                   </Popconfirm>

@@ -11,6 +11,13 @@ export interface PvString {
   moduleModel: string;
   /** 串联组件数 */
   seriesCount: number;
+  /**
+   * 原归属逆变器（组串首次挂接时的逆变器，整箱改挂也不改写）。
+   * v3 升级旧数据时回填为当前 inverterId，保证「旧数据升级也回填原归属」。
+   */
+  originInverterId: string;
+  /** 原归属汇流箱编号，语义同 originInverterId */
+  originCombinerBox: string;
   createdAt: string;
 }
 

@@ -31,7 +31,9 @@ import { formatCurrent, formatIrradiance, formatPercent, formatVoltage, share } 
 import DiscreteBadge from '../components/common/DiscreteBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
+import FreezeBanner from '../components/common/FreezeBanner';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
+import { useMigrationStore } from '../stores/migrationStore';
 
 interface SampleFormValues {
   stringId: string;
@@ -66,6 +68,7 @@ export default function SampleEntry() {
   const inverters = useDeviceStore((state) => state.inverters);
   const arrays = useDeviceStore((state) => state.arrays);
   const plants = useDeviceStore((state) => state.plants);
+  const frozen = useMigrationStore((state) => state.freeze?.frozen === true);
 
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['plant', 'inverter', 'level']);
@@ -244,14 +247,16 @@ export default function SampleEntry() {
             <Typography.Text type="secondary">只看可疑</Typography.Text>
             <Switch checked={onlySuspicious} onChange={setOnlySuspicious} size="small" />
           </Space>
-          <Button icon={<ThunderboltOutlined />} onClick={() => setBatchOpen(true)}>
+          <Button icon={<ThunderboltOutlined />} disabled={frozen} onClick={() => setBatchOpen(true)}>
             按汇流箱批量录入
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => openModal(null)}>
+          <Button type="primary" icon={<PlusOutlined />} disabled={frozen} onClick={() => openModal(null)}>
             单点录入
           </Button>
         </Space>
       </div>
+
+      <FreezeBanner scope="采集记录录入、编辑与删除（人工标记与复测回填不受影响）" />
 
       <div className="gb-stat-grid">
         <StatBadge title="采集记录" value={totals.samples} suffix="条" color="#1668dc" />
@@ -316,7 +321,7 @@ export default function SampleEntry() {
                 createLabel="单点录入"
                 onCreate={() => openModal(null)}
                 extra={
-                  <Button icon={<ThunderboltOutlined />} onClick={() => setBatchOpen(true)}>
+                  <Button icon={<ThunderboltOutlined />} disabled={frozen} onClick={() => setBatchOpen(true)}>
                     批量录入
                   </Button>
                 }
@@ -400,18 +405,20 @@ export default function SampleEntry() {
                           size="small"
                           type="link"
                           icon={<EditOutlined />}
+                          disabled={frozen}
                           onClick={() => openModal(row)}
                         />
                         <Popconfirm
                           title="删除该条采集记录？"
                           okText="删除"
                           cancelText="取消"
+                          disabled={frozen}
                           onConfirm={async () => {
                             await deleteSample(row.id);
                             message.success('采集记录已删除');
                           }}
                         >
-                          <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+                          <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={frozen} />
                         </Popconfirm>
                       </Space>
                     ),
@@ -471,7 +478,7 @@ export default function SampleEntry() {
         extra={
           <Space>
             <Button onClick={() => setModal({ open: false, editing: null })}>取消</Button>
-            <Button type="primary" onClick={() => void submit()}>
+            <Button type="primary" disabled={frozen} onClick={() => void submit()}>
               保存
             </Button>
           </Space>
@@ -526,7 +533,7 @@ export default function SampleEntry() {
         extra={
           <Space>
             <Button onClick={() => setBatchOpen(false)}>取消</Button>
-            <Button type="primary" disabled={batchRows.length === 0} onClick={() => void submitBatch()}>
+            <Button type="primary" disabled={batchRows.length === 0 || frozen} onClick={() => void submitBatch()}>
               提交 {batchRows.length} 条
             </Button>
           </Space>

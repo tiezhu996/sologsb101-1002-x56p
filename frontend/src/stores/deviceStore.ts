@@ -26,6 +26,7 @@ import type { InverterDraft, InverterLedgerRow } from '../types/inverter';
 import { formatStringCode } from '../types/string';
 import { nowIso, uuid } from '../utils/format';
 import { emitChange, subscribeChange } from '../utils/events';
+import { assertWritable } from './migrationStore';
 
 interface DeviceStoreState {
   plants: PlantRow[];
@@ -129,6 +130,7 @@ export const useDeviceStore = create<DeviceStoreState>((set, get) => ({
   },
 
   async createInverter(draft) {
+    assertWritable();
     const row: InverterRow = {
       id: uuid(),
       arrayId: draft.arrayId,
@@ -146,6 +148,7 @@ export const useDeviceStore = create<DeviceStoreState>((set, get) => ({
   },
 
   async updateInverter(inverterId, draft) {
+    assertWritable();
     const existing = get().inverters.find((item) => item.id === inverterId);
     if (!existing) return;
     await putInverter({
@@ -160,11 +163,13 @@ export const useDeviceStore = create<DeviceStoreState>((set, get) => ({
   },
 
   async deleteInverter(inverterId) {
+    assertWritable();
     await removeInverter(inverterId);
     emitChange();
   },
 
   async createString(draft) {
+    assertWritable();
     const row = newStringRow({
       inverterId: draft.inverterId,
       combinerBox: draft.combinerBox.trim(),
@@ -178,6 +183,7 @@ export const useDeviceStore = create<DeviceStoreState>((set, get) => ({
   },
 
   async updateString(stringId, draft) {
+    assertWritable();
     const existing = get().strings.find((item) => item.id === stringId);
     if (!existing) return;
     await putString({
@@ -187,16 +193,21 @@ export const useDeviceStore = create<DeviceStoreState>((set, get) => ({
       code: draft.code.trim(),
       moduleModel: draft.moduleModel.trim(),
       seriesCount: draft.seriesCount,
+      // 普通编辑不改写原归属；只有整箱搬迁流程（utils/migration）允许改挂
+      originInverterId: existing.originInverterId ?? existing.inverterId,
+      originCombinerBox: existing.originCombinerBox ?? existing.combinerBox,
     });
     emitChange();
   },
 
   async deleteString(stringId) {
+    assertWritable();
     await removeString(stringId);
     emitChange();
   },
 
   async batchCreateStrings(draft) {
+    assertWritable();
     const existing = get().strings.filter((item) => item.inverterId === draft.inverterId);
     const rows: StringRow[] = [];
     for (let offset = 0; offset < draft.count; offset += 1) {

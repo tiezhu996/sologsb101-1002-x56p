@@ -13,6 +13,7 @@ export const ROUTES = {
   samples: '/samples',
   diagnose: '/diagnose',
   disposals: '/disposals',
+  migration: '/migration',
   settings: '/settings',
 } as const;
 

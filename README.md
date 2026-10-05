@@ -54,6 +54,7 @@ docker compose up -d --build # 代码改动后重建
 | `/samples` | 采集与离散率 | 录入组串电流电压，实时计算离散率并标红越限 |
 | `/diagnose` | 失配排查工作台 | 离散率倒序、标记可疑、同汇流箱 / 同逆变器追溯 |
 | `/disposals` | 处置单 | 清洗 / 更换 / 复测三类单子派工与复测回填 |
+| `/migration` | 整箱改挂 | 扩容退运：冻结两端→箱内对账→整箱改挂→重算重派 |
 | `/settings` | 阈值与版本 | 阈值配置、结构版本、整库 JSON 导出 / 导入 |
 
 ## 五、目录结构
@@ -88,7 +89,9 @@ sologsb101-1002/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbpvstring`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，登记了 v1 → v2、v2 → v3 的 `upgrade` 迁移：
+  - v2：补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值；
+  - v3（扩容改挂）：组串补 `originInverterId / originCombinerBox`（旧数据升级回填为当前归属），处置单补 `baselineCurrentA`（已复测单按原汇流箱基准回填、结论保留）与 `redispatchCount`，新增 `migrations` / `freezes` 两张表。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -96,14 +99,27 @@ sologsb101-1002/
   | `plants` | 电站 | id / name / gridDate / latitude / capacityMWp |
   | `arrays` | 方阵 | id / plantId / code / capacityKw |
   | `inverters` | 逆变器 | id / arrayId / model / ratedKw |
-  | `strings` | 组串 | id / inverterId / combinerBox / code / moduleModel |
+  | `strings` | 组串 | id / inverterId / combinerBox / code / moduleModel / originInverterId |
   | `samples` | 采集读数 | id / stringId / sampledAt / [stringId+sampledAt] |
   | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate |
+  | `migrations` | 整箱改挂搬迁单 | id / state / updatedAt |
+  | `freezes` | 冻结单（单行 id=freeze） | id |
   | `settings` | 阈值配置 | id（固定 `threshold`） |
 
 - **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 4 个采集点 + 5 张处置单，父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。
-- **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
+- **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore / migrationStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。
+
+### 扩容整箱改挂（`/migration`）
+
+电站扩容、旧逆变器退运时，整箱组串改挂到新设备。设备台账（`strings.inverterId/combinerBox`）与采集处置（`samples/disposals` 经 `stringId` 引用）各有独立数据所有权，流程严格按序：
+
+1. **冻结两端**：设备台账的增删改、采集录入与处置单新建/派工全部暂停（`assertWritable()` 统一守卫）；复测回填不改归属、保留原结论，不在禁止之列。
+2. **箱内对账**：搬迁前按汇流箱核对台账归属与采集/处置引用是否一致（空箱、悬空引用拦截）。
+3. **整箱搬迁**：以汇流箱为单位、逐箱独立 Dexie 事务搬迁，`originInverterId/originCombinerBox` 原归属永不改写。
+4. **搬迁后处理**：源/目标两端离散率与可疑标记重算；未完成处置单（待处理/已派工）回到「待处理」按新归属重派（`redispatchCount+1`，责任人保留）；已复测单的复测电流与固化基准 `baselineCurrentA` 原样保留，结论不随新箱基准变化。
+5. **失败恢复**：单箱事务失败整体回滚、设备归属恢复源侧，搬迁单与已确认范围保留并标记 failed；重试只处理 failed/pending 条目，已 migrated 的不重复搬迁。部分失败保持冻结，全部成功后自动解冻。
+6. **旧数据升级**：v2 → v3 时组串原归属回填为当前归属，已复测处置单按原汇流箱基准回填 `baselineCurrentA`；旧版 JSON 备份导入同样兜底补齐。
 
 ## 七、本地开发
 

@@ -14,6 +14,8 @@ export interface EmptyPanelProps {
   /** 新建按钮文案，不传则不渲染主按钮 */
   createLabel?: string;
   onCreate?: () => void;
+  /** 禁用新建按钮（冻结期） */
+  createDisabled?: boolean;
   /** 重置数据按钮 */
   resetLabel?: string;
   onReset?: () => void;
@@ -26,6 +28,7 @@ export default function EmptyPanel({
   description = '当前筛选条件下没有记录，可新建一条或调整筛选条件。',
   createLabel,
   onCreate,
+  createDisabled = false,
   resetLabel,
   onReset,
   extra,
@@ -49,7 +52,7 @@ export default function EmptyPanel({
       </Typography.Paragraph>
       <Space wrap>
         {createLabel && onCreate ? (
-          <Button type="primary" icon={<PlusOutlined />} onClick={onCreate}>
+          <Button type="primary" icon={<PlusOutlined />} disabled={createDisabled} onClick={onCreate}>
             {createLabel}
           </Button>
         ) : null}

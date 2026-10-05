@@ -12,16 +12,23 @@ import type { Inverter } from '../types/inverter';
 import type { PvString } from '../types/string';
 import type { Sample } from '../types/sample';
 import type { Disposal } from '../types/disposal';
+import {
+  FREEZE_RECORD_ID,
+  type MigrationBoxItem,
+  type MigrationDraft,
+  type MigrationFreeze,
+  type StringMigration,
+} from '../types/migration';
 import { DEFAULT_THRESHOLDS, type ThresholdRow } from '../types/settings';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
-import { normalizeCurrent, discreteRate } from './discrete';
+import { boxBaselineCurrent, normalizeCurrent, discreteRate, recalcGroups } from './discrete';
 import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 
 /** 数据库名（浏览器 IndexedDB 库名） */
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -32,6 +39,8 @@ export type InverterRow = Inverter & Revisioned;
 export type StringRow = PvString & Revisioned;
 export type SampleRow = Sample & Revisioned;
 export type DisposalRow = Disposal & Revisioned;
+export type MigrationRow = StringMigration & Revisioned;
+export type MigrationFreezeRow = MigrationFreeze & Revisioned;
 
 class PvStringDatabase extends Dexie {
   plants!: Table<PlantRow, string>;
@@ -41,6 +50,10 @@ class PvStringDatabase extends Dexie {
   samples!: Table<SampleRow, string>;
   disposals!: Table<DisposalRow, string>;
   settings!: Table<ThresholdRow, string>;
+  /** 整箱改挂搬迁单 */
+  migrations!: Table<MigrationRow, string>;
+  /** 冻结单（固定单行 id=freeze） */
+  freezes!: Table<MigrationFreezeRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -95,6 +108,65 @@ class PvStringDatabase extends Dexie {
         if (!existing) {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
         }
+      });
+
+    // v3：电站扩容改挂。组串补「原归属」（originInverterId/originCombinerBox，旧数据回填为当前归属），
+    //     处置单补「复测固化基准 baselineCurrentA / 重派次数 redispatchCount」；
+    //     新增 migrations（搬迁单）与 freezes（冻结单）两张表。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plants: 'id, name, gridDate, latitude, capacityMWp',
+        arrays: 'id, plantId, code, capacityKw',
+        inverters: 'id, arrayId, model, ratedKw',
+        strings: 'id, inverterId, combinerBox, code, moduleModel, originInverterId',
+        samples: 'id, stringId, sampledAt, [stringId+sampledAt]',
+        disposals: 'id, stringId, state, type, owner, dueDate',
+        settings: 'id',
+        migrations: 'id, state, updatedAt',
+        freezes: 'id',
+      })
+      .upgrade(async (tx) => {
+        // 组串：行修订号升到 3；旧数据升级也回填原归属（首次挂接归属 = 升级时当前归属）
+        await tx
+          .table<StringRow, string>('strings')
+          .toCollection()
+          .modify((row) => {
+            row.revision = ROW_REVISION;
+            if (typeof row.inverterId === 'string' && typeof row.originInverterId !== 'string') {
+              row.originInverterId = row.inverterId;
+            }
+            if (typeof row.combinerBox === 'string' && typeof row.originCombinerBox !== 'string') {
+              row.originCombinerBox = row.combinerBox;
+            }
+          });
+
+        // 处置单：补重派次数；已复测单按原汇流箱基准回填并固化结论
+        const stringRows = await tx.table<StringRow, string>('strings').toArray();
+        const seriesByGroup = new Map<string, number[]>();
+        for (const str of stringRows) {
+          const key = `${str.inverterId}::${str.combinerBox}`;
+          const list = seriesByGroup.get(key);
+          if (list) list.push(str.seriesCount);
+          else seriesByGroup.set(key, [str.seriesCount]);
+        }
+        await tx
+          .table<DisposalRow, string>('disposals')
+          .toCollection()
+          .modify((row) => {
+            row.revision = ROW_REVISION;
+            if (typeof row.redispatchCount !== 'number') row.redispatchCount = 0;
+            if (row.state === 'retested' && typeof row.baselineCurrentA !== 'number') {
+              const owner = stringRows.find((item) => item.id === row.stringId);
+              // 已复测结论保留原基准：用升级当时的原归属汇流箱基准回填
+              const series = owner
+                ? (seriesByGroup.get(`${owner.inverterId}::${owner.combinerBox}`) ?? [])
+                : [];
+              row.baselineCurrentA = boxBaselineCurrent(series);
+            }
+            if (row.state !== 'retested' && typeof row.baselineCurrentA !== 'number') {
+              row.baselineCurrentA = null;
+            }
+          });
       });
   }
 }
@@ -295,6 +367,9 @@ async function seedDatabase(): Promise<void> {
               code: `${boxPlan.box.replace('BX-', '')}-${String(offset + 1).padStart(2, '0')}`,
               moduleModel: boxPlan.moduleModel,
               seriesCount: boxPlan.seriesCount,
+              // 首次挂接：原归属即当前归属
+              originInverterId: inverterId,
+              originCombinerBox: boxPlan.box,
               createdAt: stamp,
               revision: ROW_REVISION,
             });
@@ -370,6 +445,9 @@ async function seedDatabase(): Promise<void> {
       owner: owners[index % owners.length],
       dueDate: shiftDate(index % 2 === 0 ? 3 : -2),
       retestCurrentA: state === 'retested' ? round(9.1 + index * 0.18, 2) : null,
+      // 已复测单：固化复测当时的同箱基准电流（26 串 → 9.4 A）
+      baselineCurrentA: state === 'retested' ? 9.4 : null,
+      redispatchCount: 0,
       initialDiscreteRate: rate,
       createdAt: stamp,
       updatedAt: stamp,
@@ -379,7 +457,7 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.migrations, db.freezes],
     async () => {
       await db.plants.bulkPut(plants);
       await db.arrays.bulkPut(arrays);
@@ -588,8 +666,170 @@ export async function putThresholds(row: ThresholdRow): Promise<void> {
   await db.settings.put(row);
 }
 
-/* ========================== 整库导入导出 ========================== */
+/* ======================= 冻结单（两端录入/派工冻结） ======================= */
 
+const UNFROZEN_FREEZE: Omit<MigrationFreezeRow, 'updatedAt'> = {
+  id: FREEZE_RECORD_ID,
+  frozen: false,
+  operator: '',
+  reason: '',
+  frozenAt: undefined,
+  releasedAt: undefined,
+  migrationId: undefined,
+  revision: ROW_REVISION,
+};
+
+export async function getFreeze(): Promise<MigrationFreezeRow> {
+  const row = await db.freezes.get(FREEZE_RECORD_ID);
+  return row ?? { ...UNFROZEN_FREEZE, updatedAt: nowIso() };
+}
+
+export async function putFreeze(row: MigrationFreezeRow): Promise<void> {
+  await db.freezes.put(row);
+}
+
+/* ============================ 搬迁单 ============================ */
+
+export async function listMigrations(): Promise<MigrationRow[]> {
+  const rows = await db.migrations.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function getMigration(id: string): Promise<MigrationRow | undefined> {
+  return db.migrations.get(id);
+}
+
+export async function putMigration(row: MigrationRow): Promise<void> {
+  await db.migrations.put(row);
+}
+
+export async function removeMigration(id: string): Promise<void> {
+  await db.migrations.delete(id);
+}
+
+/** 由草稿构造一条搬迁单（全部箱条目初始 pending） */
+export function newMigrationRow(draft: MigrationDraft): MigrationRow {
+  const stamp = nowIso();
+  const boxes: MigrationBoxItem[] = draft.boxes.map((box) => ({
+    sourceInverterId: box.sourceInverterId,
+    sourceCombinerBox: box.sourceCombinerBox,
+    targetInverterId: box.targetInverterId,
+    targetCombinerBox: box.targetCombinerBox,
+    stringIds: [...box.stringIds],
+    state: 'pending',
+  }));
+  return {
+    id: uuid(),
+    name: draft.name.trim(),
+    operator: draft.operator.trim(),
+    sourceInverterIds: [...new Set(draft.sourceInverterIds)],
+    targetInverterIds: [...new Set(draft.targetInverterIds)],
+    boxes,
+    state: 'draft',
+    createdAt: stamp,
+    updatedAt: stamp,
+    revision: ROW_REVISION,
+  };
+}
+
+export interface BoxMoveOutcome {
+  movedStringIds: string[];
+  redisposed: number;
+  retainedRetests: number;
+  recalcKeys: string[];
+}
+
+/**
+ * 按「整箱」原子搬迁一个汇流箱条目（单 Dexie 事务）。
+ * - 仅搬迁仍挂在源逆变器/源汇流箱下的组串（重试不重复搬迁：已在目标侧的跳过）
+ * - 未完成处置单按新归属重派：状态回到 pending、redispatchCount+1
+ * - 已复测处置单不动：复测电流与固化基准 baselineCurrentA 保留原结论
+ * - 源/目标两个汇流箱分组的离散率一起重算并回写
+ * 事务内任一步失败由 Dexie 整体回滚，设备归属恢复为源侧；调用方另行把该条目标记 failed。
+ */
+export async function moveMigrationBox(item: MigrationBoxItem): Promise<BoxMoveOutcome> {
+  // 前置校验放在事务外：失败不触碰任何数据
+  const targetInverter = await db.inverters.get(item.targetInverterId);
+  if (!targetInverter) throw new Error('目标逆变器不存在或已删除');
+  if (item.targetInverterId === item.sourceInverterId) {
+    throw new Error('目标逆变器不能与退运源逆变器相同');
+  }
+
+  return db.transaction(
+    'rw',
+    [db.strings, db.samples, db.disposals],
+    async (): Promise<BoxMoveOutcome> => {
+      // —— 事务内先读，计算出全部待写入对象后再一次性提交，保证失败可整体回滚 ——
+      const wanted = new Set(item.stringIds);
+      // 仍挂在源侧的组串才搬迁；已在目标侧（上次已成功）的视为幂等跳过
+      const owners = await db.strings.where('inverterId').equals(item.sourceInverterId).toArray();
+      const moving = owners.filter(
+        (row) => row.combinerBox === item.sourceCombinerBox && wanted.has(row.id),
+      );
+      const movingIds = moving.map((row) => row.id);
+      const movingIdSet = new Set(movingIds);
+
+      const nextStrings: StringRow[] = moving.map((row) => ({
+        ...row,
+        inverterId: item.targetInverterId,
+        combinerBox: item.targetCombinerBox,
+        // origin* 原归属不改写
+      }));
+
+      const affectedDisposals =
+        movingIds.length > 0
+          ? await db.disposals.where('stringId').anyOf(movingIds).toArray()
+          : [];
+      const stamp = nowIso();
+      let redisposed = 0;
+      let retainedRetests = 0;
+      const nextDisposals: DisposalRow[] = [];
+      for (const disposal of affectedDisposals) {
+        if (disposal.state === 'retested') {
+          // 已复测结论保留原基准：不改 state / retestCurrentA / baselineCurrentA
+          retainedRetests += 1;
+          continue;
+        }
+        // 未完成处置单按新归属重派：回到待处理，责任人保留，重派次数 +1
+        nextDisposals.push({
+          ...disposal,
+          state: 'pending',
+          redispatchCount: (disposal.redispatchCount ?? 0) + 1,
+          updatedAt: stamp,
+        });
+        redisposed += 1;
+      }
+
+      // 两端离散率重算：源箱（可能留有同箱其它未搬组串）+ 目标箱
+      const [allStrings, allSamples] = await Promise.all([db.strings.toArray(), db.samples.toArray()]);
+      const projectedStrings = allStrings.map((row) =>
+        movingIdSet.has(row.id)
+          ? { ...row, inverterId: item.targetInverterId, combinerBox: item.targetCombinerBox }
+          : row,
+      );
+      const sourceKey = `${item.sourceInverterId}::${item.sourceCombinerBox}`;
+      const targetKey = `${item.targetInverterId}::${item.targetCombinerBox}`;
+      const { updated: nextSamples, affectedKeys } = recalcGroups(projectedStrings, allSamples, [
+        sourceKey,
+        targetKey,
+      ]);
+
+      // —— 统一提交：任一处异常，Dexie 回滚整个事务，设备归属恢复源侧 ——
+      if (nextStrings.length > 0) await db.strings.bulkPut(nextStrings);
+      if (nextDisposals.length > 0) await db.disposals.bulkPut(nextDisposals);
+      if (nextSamples.length > 0) await db.samples.bulkPut(nextSamples);
+
+      return {
+        movedStringIds: movingIds,
+        redisposed,
+        retainedRetests,
+        recalcKeys: affectedKeys,
+      };
+    },
+  );
+}
+
+/* ========================== 整库导入导出 ========================== */
 export interface DatabaseSnapshot {
   name: string;
   schemaVersion: number;
@@ -601,6 +841,9 @@ export interface DatabaseSnapshot {
   samples: Sample[];
   disposals: Disposal[];
   thresholds: ThresholdRow;
+  /** v3 起携带：搬迁单与冻结单（旧备份导入时可能缺失，按空处理） */
+  migrations: StringMigration[];
+  freeze: MigrationFreeze | null;
 }
 
 function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
@@ -609,15 +852,19 @@ function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plants, arrays, inverters, strings, samples, disposals, thresholds] = await Promise.all([
-    listPlants(),
-    listArrays(),
-    listInverters(),
-    listStrings(),
-    listSamples(),
-    listDisposals(),
-    getThresholds(),
-  ]);
+  const [plants, arrays, inverters, strings, samples, disposals, thresholds, migrations, freezeRow] =
+    await Promise.all([
+      listPlants(),
+      listArrays(),
+      listInverters(),
+      listStrings(),
+      listSamples(),
+      listDisposals(),
+      getThresholds(),
+      listMigrations(),
+      getFreeze(),
+    ]);
+  const { revision: _freezeRevision, ...freeze } = freezeRow;
   return {
     name: DB_NAME,
     schemaVersion: DB_SCHEMA_VERSION,
@@ -629,14 +876,63 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     samples: samples.map(stripRevision),
     disposals: disposals.map(stripRevision),
     thresholds,
+    migrations: migrations.map(stripRevision),
+    freeze: freezeRow.frozen || freezeRow.migrationId ? freeze : null,
   };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
+  // 兼容旧版备份：组串缺失原归属时回填为当前归属；处置单缺失基准/重派次数字段时兜底
+  const strings: StringRow[] = (snapshot.strings ?? []).map((row) =>
+    rev({
+      ...row,
+      originInverterId: typeof row.originInverterId === 'string' ? row.originInverterId : row.inverterId,
+      originCombinerBox:
+        typeof row.originCombinerBox === 'string' ? row.originCombinerBox : row.combinerBox,
+    }),
+  );
+  // 按组串原归属分组，给旧备份中已复测处置单回填固化基准
+  const seriesByGroup = new Map<string, number[]>();
+  for (const str of strings) {
+    const key = `${str.inverterId}::${str.combinerBox}`;
+    const list = seriesByGroup.get(key);
+    if (list) list.push(str.seriesCount);
+    else seriesByGroup.set(key, [str.seriesCount]);
+  }
+  const disposals: DisposalRow[] = (snapshot.disposals ?? []).map((row) => {
+    const next: DisposalRow = rev({
+      ...row,
+      redispatchCount: typeof row.redispatchCount === 'number' ? row.redispatchCount : 0,
+      baselineCurrentA: typeof row.baselineCurrentA === 'number' ? row.baselineCurrentA : null,
+    });
+    if (next.state === 'retested' && next.baselineCurrentA === null) {
+      const owner = strings.find((item) => item.id === next.stringId);
+      const series = owner
+        ? (seriesByGroup.get(`${owner.inverterId}::${owner.combinerBox}`) ?? [])
+        : [];
+      next.baselineCurrentA = boxBaselineCurrent(series);
+    }
+    return next;
+  });
+  const migrationRows: MigrationRow[] = (snapshot.migrations ?? []).map((row) => rev(row));
+  const freezeRow: MigrationFreezeRow | null = snapshot.freeze
+    ? rev(snapshot.freeze)
+    : { ...UNFROZEN_FREEZE, updatedAt: nowIso() };
+
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [
+      db.plants,
+      db.arrays,
+      db.inverters,
+      db.strings,
+      db.samples,
+      db.disposals,
+      db.settings,
+      db.migrations,
+      db.freezes,
+    ],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -645,13 +941,17 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.strings.clear(),
         db.samples.clear(),
         db.disposals.clear(),
+        db.migrations.clear(),
+        db.freezes.clear(),
       ]);
       await db.plants.bulkPut((snapshot.plants ?? []).map(rev));
       await db.arrays.bulkPut((snapshot.arrays ?? []).map(rev));
       await db.inverters.bulkPut((snapshot.inverters ?? []).map(rev));
-      await db.strings.bulkPut((snapshot.strings ?? []).map(rev));
+      await db.strings.bulkPut(strings);
       await db.samples.bulkPut((snapshot.samples ?? []).map(rev));
-      await db.disposals.bulkPut((snapshot.disposals ?? []).map(rev));
+      await db.disposals.bulkPut(disposals);
+      await db.migrations.bulkPut(migrationRows);
+      if (freezeRow) await db.freezes.put(freezeRow);
       if (snapshot.thresholds) await db.settings.put(snapshot.thresholds);
     },
   );
@@ -661,7 +961,17 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [
+      db.plants,
+      db.arrays,
+      db.inverters,
+      db.strings,
+      db.samples,
+      db.disposals,
+      db.settings,
+      db.migrations,
+      db.freezes,
+    ],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -671,6 +981,8 @@ export async function resetDatabase(): Promise<void> {
         db.samples.clear(),
         db.disposals.clear(),
         db.settings.clear(),
+        db.migrations.clear(),
+        db.freezes.clear(),
       ]);
     },
   );
@@ -679,15 +991,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计，用于页脚与阈值页概览 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plants, arrays, inverters, strings, samples, disposals] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, migrations] = await Promise.all([
     db.plants.count(),
     db.arrays.count(),
     db.inverters.count(),
     db.strings.count(),
     db.samples.count(),
     db.disposals.count(),
+    db.migrations.count(),
   ]);
-  return { plants, arrays, inverters, strings, samples, disposals };
+  return { plants, arrays, inverters, strings, samples, disposals, migrations };
 }
 
 /** 结构版本信息（/settings 页展示） */
@@ -722,6 +1035,9 @@ export function newStringRow(input: {
     code: input.code,
     moduleModel: input.moduleModel,
     seriesCount: input.seriesCount,
+    // 新建组串：原归属记录为首次挂接位置，后续整箱改挂不改写
+    originInverterId: input.inverterId,
+    originCombinerBox: input.combinerBox,
     createdAt: nowIso(),
     revision: ROW_REVISION,
   };
